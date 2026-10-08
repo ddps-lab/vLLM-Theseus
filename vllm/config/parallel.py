@@ -47,6 +47,7 @@ All2AllBackend = Literal[
     "mori_low_latency",
     "nixl_ep",
     "allgather_reducescatter",
+    "p2p_nccl",
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
     "flashinfer_nvlink_one_sided",
@@ -187,6 +188,8 @@ class ParallelConfig:
     """All2All backend for MoE expert parallel communication. Available options:
 
     - "allgather_reducescatter": All2all based on allgather and reducescatter
+    - "p2p_nccl": Point-to-point NCCL send/recv to the ranks that own the
+      selected experts only (works over TCP, eager mode only)
     - "deepep_high_throughput": Use deepep high-throughput kernels
     - "deepep_low_latency": Use deepep low-latency kernels
     - "mori_high_throughput": MoRI EP with InterNodeV1 for multi-node

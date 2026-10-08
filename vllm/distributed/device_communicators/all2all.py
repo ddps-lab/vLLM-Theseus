@@ -20,6 +20,7 @@ from vllm.utils.func_utils import supports_kw
 from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
 
 from .base_device_communicator import All2AllManagerBase, Cache
+from .p2p_nccl_all2all import P2pAll2AllEngine
 
 if has_flashinfer_nvlink_two_sided():
     from flashinfer.comm import Mapping  # type: ignore[import-not-found]
@@ -1024,3 +1025,67 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             for _, handle in self.handle_cache._cache.items():
                 handle.destroy()
             self.handle_cache._cache.clear()
+
+
+class P2pNcclAll2AllManager(All2AllManagerBase):
+    """
+    Selective point-to-point all2all over NCCL send/recv (torch.distributed
+    all_to_all_single with variable splits). Tokens are only sent to the EP
+    ranks that own one of their selected experts. Dispatch/combine are driven
+    by P2pNcclPrepareAndFinalize through the engine handle; the generic
+    dispatch()/combine() entry points are intentionally unsupported.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        super().__init__(cpu_group, tcp_store_group)
+        self._engine: P2pAll2AllEngine | None = None
+
+    def get_handle(self, kwargs):
+        num_local_experts = kwargs["num_local_experts"]
+        max_tokens_per_rank = kwargs["max_tokens_per_rank"]
+        if self._engine is None:
+            # The EP group is only fully constructed after this manager is
+            # created, so resolve its NCCL process group lazily.
+            ep_group = get_ep_group()
+            self._engine = P2pAll2AllEngine(
+                group=ep_group.device_group,
+                rank=self.rank,
+                world_size=self.world_size,
+                num_local_experts=num_local_experts,
+                max_tokens_per_rank=max_tokens_per_rank,
+                device=ep_group.device,
+            )
+            logger.info_once(
+                "p2p_nccl all2all: world_size=%d, %d local experts, "
+                "buffer capacity %d rows per tensor.",
+                self.world_size,
+                num_local_experts,
+                self._engine.capacity,
+            )
+        else:
+            assert self._engine.num_local_experts == num_local_experts, (
+                "p2p_nccl all2all: layers with different local expert counts "
+                "are not supported"
+            )
+            if max_tokens_per_rank > self._engine.max_tokens_per_rank:
+                self._engine.max_tokens_per_rank = max_tokens_per_rank
+                self._engine.capacity = max_tokens_per_rank * self.world_size
+        return self._engine
+
+    def dispatch_router_logits(self, *args, **kwargs):
+        raise NotImplementedError(
+            "p2p_nccl all2all is used through P2pNcclPrepareAndFinalize"
+        )
+
+    def dispatch(self, *args, **kwargs):
+        raise NotImplementedError(
+            "p2p_nccl all2all is used through P2pNcclPrepareAndFinalize"
+        )
+
+    def combine(self, *args, **kwargs):
+        raise NotImplementedError(
+            "p2p_nccl all2all is used through P2pNcclPrepareAndFinalize"
+        )
+
+    def destroy(self):
+        self._engine = None

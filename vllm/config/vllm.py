@@ -1528,6 +1528,18 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        if (
+            self.parallel_config.all2all_backend == "p2p_nccl"
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            logger.warning(
+                "all2all_backend=p2p_nccl exchanges per-destination token counts "
+                "with the host in every MoE layer, which cannot be captured in a "
+                "CUDA graph. Disabling CUDA graphs (equivalent to "
+                "-cc.cudagraph_mode=none)."
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [

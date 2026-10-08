@@ -1095,6 +1095,10 @@ class FusedMoEParallelConfig:
         )
 
     @property
+    def use_p2p_nccl_kernels(self):
+        return self.use_all2all_kernels and self.all2all_backend == "p2p_nccl"
+
+    @property
     def use_mori_kernels(self):
         return self.use_all2all_kernels and self.all2all_backend in (
             "mori_high_throughput",
@@ -1438,6 +1442,10 @@ class FusedMoEConfig:
     @property
     def use_ag_rs_all2all_kernels(self):
         return self.moe_parallel_config.use_ag_rs_all2all_kernels
+
+    @property
+    def use_p2p_nccl_kernels(self):
+        return self.moe_parallel_config.use_p2p_nccl_kernels
 
     @property
     def use_nixl_ep_kernels(self):
