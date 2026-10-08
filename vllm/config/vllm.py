@@ -1546,13 +1546,15 @@ class VllmConfig:
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "nixl_ep",
+                "p2p_nccl",
             ], (
                 "Microbatching currently only supports the deepep_low_latency, "
-                "deepep_high_throughput, and nixl_ep all2all backends. "
+                "deepep_high_throughput, nixl_ep, and p2p_nccl all2all backends. "
                 f"{a2a_backend} is not supported. To fix use "
                 "--all2all-backend=deepep_low_latency, "
-                "--all2all-backend=deepep_high_throughput, or "
-                "--all2all-backend=nixl_ep and install the matching kernels."
+                "--all2all-backend=deepep_high_throughput, "
+                "--all2all-backend=nixl_ep (and install the matching kernels), "
+                "or --all2all-backend=p2p_nccl."
             )
 
             if not self.model_config.disable_cascade_attn:
