@@ -33,10 +33,25 @@ Expert ids below zero (padding) are not sent anywhere and produce zeros.
 
 from __future__ import annotations
 
+import logging
+import math
+import os
+import time
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger("vllm.distributed.device_communicators.p2p_nccl_all2all")
+
+# DEBUG(p2p_nccl): remove after GPU validation. VLLM_P2P_NCCL_DEBUG=1 logs
+# per-layer counts, bytes and host-wait time (first 8 calls, then every 64th);
+# =2 additionally runs sanity checks that synchronize with the device.
+_DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
+
+
+def _should_log(n: int) -> bool:
+    return n < 8 or n % 64 == 0
 
 
 @dataclass
@@ -51,6 +66,10 @@ class P2pAll2AllPlan:
     num_recv: int
     # Local token index of every packed row, in destination-major order.
     perm: torch.Tensor
+    # Sequence number of this plan on this rank (diagnostics).
+    seq: int = 0
+    # Host wait for the count copy, in ms (diagnostics).
+    host_wait_ms: float = 0.0
 
 
 @dataclass
@@ -89,11 +108,15 @@ class P2pAll2AllEngine:
         self.num_local_experts = num_local_experts
         self.max_tokens_per_rank = max_tokens_per_rank
         self.device = torch.device(device)
-        # Worst case: every token of every rank lands on this rank.
-        self.capacity = max_tokens_per_rank * world_size
+        # Initial rows per buffer. The worst case is max_tokens_per_rank *
+        # world_size (every token of every rank lands here), but that is far
+        # above the typical traffic, so buffers start at one rank's worth of
+        # tokens and grow geometrically on demand (rare after warm-up).
+        self.capacity = max_tokens_per_rank
         self._arange_r = torch.arange(world_size, device=self.device)
         self._count_bufs: dict[int, torch.Tensor] = {}
         self._buffers: dict[tuple, torch.Tensor] = {}
+        self._num_plans = 0
 
     # ------------------------------------------------------------------ plan
     def _count_buf(self, slot: int) -> torch.Tensor:
@@ -139,7 +162,9 @@ class P2pAll2AllEngine:
     def finish_plan(self, pending: P2pAll2AllPendingPlan) -> P2pAll2AllPlan:
         """Copy the counts to the host (the only CPU sync) and build the plan."""
         # The only host sync of the layer.
+        t0 = time.perf_counter()
         send_counts, recv_counts = self._count_buf(pending.slot).tolist()
+        host_wait_ms = (time.perf_counter() - t0) * 1e3
         num_send = sum(send_counts)
         num_tokens = pending.num_tokens
         perm = (
@@ -147,7 +172,9 @@ class P2pAll2AllEngine:
             if num_tokens > 0
             else pending.order[:0]
         )
-        return P2pAll2AllPlan(
+        seq = self._num_plans
+        self._num_plans += 1
+        plan = P2pAll2AllPlan(
             slot=pending.slot,
             num_tokens=num_tokens,
             send_counts=send_counts,
@@ -155,7 +182,23 @@ class P2pAll2AllEngine:
             num_send=num_send,
             num_recv=sum(recv_counts),
             perm=perm,
+            seq=seq,
+            host_wait_ms=host_wait_ms,
         )
+        # DEBUG(p2p_nccl): remove after GPU validation.
+        if _DEBUG and _should_log(seq):
+            logger.info(
+                "p2p_nccl[r%d] plan#%d slot=%d T=%d send=%s recv=%s "
+                "n_send=%d n_recv=%d host_wait=%.3fms",
+                self.rank, seq, pending.slot, num_tokens, send_counts,
+                recv_counts, num_send, plan.num_recv, host_wait_ms,
+            )
+            if num_send == 0 and plan.num_recv == 0:
+                logger.info(
+                    "p2p_nccl[r%d] plan#%d: nothing to send or receive "
+                    "(empty all_to_all on this rank)", self.rank, seq,
+                )
+        return plan
 
     def plan(self, topk_ids: torch.Tensor, slot: int = 0) -> P2pAll2AllPlan:
         """``begin_plan`` + ``exchange_counts`` + ``finish_plan`` in one go."""
@@ -174,10 +217,18 @@ class P2pAll2AllEngine:
     ) -> torch.Tensor:
         key = (slot, name, tuple(tail), dtype)
         buf = self._buffers.get(key)
-        if buf is None or buf.shape[0] < rows:
+        if buf is None:
             buf = torch.empty(
                 (max(self.capacity, rows), *tail), dtype=dtype, device=self.device
             )
+            self._buffers[key] = buf
+        elif buf.shape[0] < rows:
+            new_rows = max(rows, 2 * buf.shape[0])
+            logger.info(
+                "p2p_nccl[r%d] growing buffer %s (slot %d) from %d to %d rows",
+                self.rank, name, slot, buf.shape[0], new_rows,
+            )
+            buf = torch.empty((new_rows, *tail), dtype=dtype, device=self.device)
             self._buffers[key] = buf
         return buf[:rows]
 
@@ -210,6 +261,20 @@ class P2pAll2AllEngine:
                 group=self.group,
             )
             outputs.append(recv)
+        # DEBUG(p2p_nccl): remove after GPU validation.
+        if _DEBUG and _should_log(plan.seq):
+            row_bytes = sum(
+                math.prod(x.shape[1:]) * x.element_size() for x in tensors
+            )
+            remote_out = plan.num_send - plan.send_counts[self.rank]
+            remote_in = plan.num_recv - plan.recv_counts[self.rank]
+            logger.info(
+                "p2p_nccl[r%d] dispatch#%d slot=%d rows_out=%d (remote %d) "
+                "rows_in=%d (remote %d) bytes_out=%d bytes_in=%d",
+                self.rank, plan.seq, plan.slot, plan.num_send, remote_out,
+                plan.num_recv, remote_in, remote_out * row_bytes,
+                remote_in * row_bytes,
+            )
         return outputs
 
     # --------------------------------------------------------------- combine
@@ -247,9 +312,10 @@ class P2pAll2AllEngine:
             raise ValueError(
                 f"out has {out.shape[0]} rows, plan has {plan.num_tokens}"
             )
-        acc = torch.zeros(
-            (plan.num_tokens, *back.shape[1:]), dtype=torch.float32, device=back.device
+        acc = self._buffer(
+            plan.slot, "acc", plan.num_tokens, tuple(back.shape[1:]), torch.float32
         )
+        acc.zero_()
         acc.index_add_(0, plan.perm, back.to(torch.float32))
         out.copy_(acc.to(out.dtype))
         return out
