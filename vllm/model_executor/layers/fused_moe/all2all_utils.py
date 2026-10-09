@@ -31,6 +31,9 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_two
 from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_nccl import (
     P2pNcclPrepareAndFinalize,
 )
+from vllm.model_executor.layers.fused_moe.prepare_finalize.prerouted import (
+    PreroutedPrepareAndFinalize,
+)
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import (
     has_deep_ep,
@@ -340,6 +343,23 @@ def maybe_make_prepare_finalize(
             num_experts=moe.num_experts,
             num_local_experts=moe.num_local_experts,
             rank=all2all_manager.rank,
+        )
+
+    elif moe.use_prerouted_kernels:
+        if moe.moe_parallel_config.enable_eplb:
+            raise NotImplementedError(
+                "all2all_backend=prerouted assumes a contiguous expert "
+                "placement and does not support EPLB."
+            )
+        if moe.moe_parallel_config.is_sequence_parallel:
+            raise NotImplementedError(
+                "all2all_backend=prerouted does not support sequence-parallel MoE."
+            )
+        prepare_finalize = PreroutedPrepareAndFinalize(
+            num_experts=moe.num_experts,
+            num_local_experts=moe.num_local_experts,
+            rank=all2all_manager.rank,
+            num_dispatchers=all2all_manager.world_size,
         )
 
     elif moe.use_ag_rs_all2all_kernels and allow_new_interface:

@@ -1089,3 +1089,29 @@ class P2pNcclAll2AllManager(All2AllManagerBase):
 
     def destroy(self):
         self._engine = None
+
+
+class PreroutedAll2AllManager(All2AllManagerBase):
+    """
+    Placeholder manager for the "prerouted" backend: the tokens of this EP
+    rank were already delivered by an external transport (e.g. the AFD
+    one-hop connector), so no all2all communication is performed here.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        super().__init__(cpu_group, tcp_store_group)
+
+    def get_handle(self, kwargs):
+        return None
+
+    def dispatch_router_logits(self, *args, **kwargs):
+        raise NotImplementedError("prerouted all2all performs no communication")
+
+    def dispatch(self, *args, **kwargs):
+        raise NotImplementedError("prerouted all2all performs no communication")
+
+    def combine(self, *args, **kwargs):
+        raise NotImplementedError("prerouted all2all performs no communication")
+
+    def destroy(self):
+        pass
