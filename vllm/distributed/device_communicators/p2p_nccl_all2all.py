@@ -54,6 +54,20 @@ def _should_log(n: int) -> bool:
     return n < 8 or n % 64 == 0
 
 
+# NCCL/gloo have no 8-bit float type; such tensors travel as uint8 views.
+_FP8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
+    if hasattr(torch, name)
+)
+
+
+def _as_wire(x: torch.Tensor) -> torch.Tensor:
+    if x.dtype in _FP8_DTYPES:
+        return x.contiguous().view(torch.uint8)
+    return x
+
+
 @dataclass
 class P2pAll2AllPlan:
     """Host-side description of one dispatch/combine round."""
@@ -86,7 +100,10 @@ class P2pAll2AllEngine:
     """Selective token exchange between the ranks of one expert-parallel group.
 
     Experts are assumed to be assigned contiguously: rank ``r`` owns global
-    experts ``[r * num_local_experts, (r + 1) * num_local_experts)``.
+    experts ``[r * num_local_experts, (r + 1) * num_local_experts)``. Ranks
+    beyond ``num_experts / num_local_experts`` own no experts and only send
+    (e.g. attention ranks of a one-hop AFD deployment); ranks that own
+    experts may have no tokens of their own and only receive.
     """
 
     def __init__(
@@ -97,12 +114,19 @@ class P2pAll2AllEngine:
         num_local_experts: int,
         max_tokens_per_rank: int,
         device: torch.device | str,
+        combine_group: dist.ProcessGroup | None = None,
     ) -> None:
         if num_local_experts <= 0:
             raise ValueError("num_local_experts must be positive")
         if max_tokens_per_rank <= 0:
             raise ValueError("max_tokens_per_rank must be positive")
         self.group = group
+        # Collectives on one communicator must be issued in the same order by
+        # every rank. When senders and receivers interleave dispatch and
+        # combine differently (e.g. attention ranks issue all dispatches of a
+        # layer before the first combine while FFN ranks alternate), the
+        # combine must live on its own communicator.
+        self.combine_group = combine_group if combine_group is not None else group
         self.rank = rank
         self.world_size = world_size
         self.num_local_experts = num_local_experts
@@ -249,10 +273,11 @@ class P2pAll2AllEngine:
                 raise ValueError(
                     f"tensor {i} has {x.shape[0]} rows, plan has {plan.num_tokens}"
                 )
-            tail = tuple(x.shape[1:])
-            packed = self._buffer(plan.slot, f"send{i}", plan.num_send, tail, x.dtype)
-            torch.index_select(x, 0, plan.perm, out=packed)
-            recv = self._buffer(plan.slot, f"recv{i}", plan.num_recv, tail, x.dtype)
+            xw = _as_wire(x)
+            tail = tuple(xw.shape[1:])
+            packed = self._buffer(plan.slot, f"send{i}", plan.num_send, tail, xw.dtype)
+            torch.index_select(xw, 0, plan.perm, out=packed)
+            recv = self._buffer(plan.slot, f"recv{i}", plan.num_recv, tail, xw.dtype)
             dist.all_to_all_single(
                 recv,
                 packed,
@@ -260,7 +285,7 @@ class P2pAll2AllEngine:
                 input_split_sizes=plan.send_counts,
                 group=self.group,
             )
-            outputs.append(recv)
+            outputs.append(recv.view(x.dtype) if xw is not x else recv)
         # DEBUG(p2p_nccl): remove after GPU validation.
         if _DEBUG and _should_log(plan.seq):
             row_bytes = sum(
@@ -297,7 +322,7 @@ class P2pAll2AllEngine:
             partial.contiguous(),
             output_split_sizes=plan.send_counts,
             input_split_sizes=plan.recv_counts,
-            group=self.group,
+            group=self.combine_group,
         )
         return back
 

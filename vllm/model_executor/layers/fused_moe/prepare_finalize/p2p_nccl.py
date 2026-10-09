@@ -10,11 +10,11 @@ the DeepEP high-throughput path uses) and their routing weights are zeroed.
 The combine returns the weighted partial sums to the owner rank, so the
 finalize output is already reduced across the EP group.
 
-Activations are always dispatched unquantized; when the experts kernel wants
-quantized inputs they are quantized after the dispatch, on the received rows
-(same order as DeepEP high-throughput for non-block quantization). Since
-every quantization scheme vLLM uses here is per-token, per-group or static,
-the result is identical to quantizing before the dispatch.
+When the experts kernel wants quantized inputs, activations are quantized
+before the dispatch and the quantized values travel on the wire (8-bit
+tensors are sent as uint8 views). Per-token or per-group scales are sent
+along as an extra tensor; static scales are replicated on every rank and are
+not sent.
 
 Dual batch overlap: ``prepare_async``/``finalize_async`` follow the DeepEP
 pattern. The count exchange is queued on the communication stream and the
@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
@@ -57,6 +58,55 @@ logger = init_logger(__name__)
 
 # DEBUG(p2p_nccl): remove after GPU validation (see p2p_nccl_all2all.py).
 _DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
+
+
+def _quantize_for_dispatch(
+    a1: torch.Tensor,
+    quant_config: FusedMoEQuantConfig,
+    defer_input_quant: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Quantize ``a1`` before the dispatch.
+
+    Returns ``(a1q, scale_to_send, scale)``. ``scale_to_send`` is the scale
+    tensor when it has one row per token (it travels with the tokens),
+    otherwise ``None`` (static scale, replicated on every rank).
+    """
+    if defer_input_quant or quant_config.quant_dtype is None:
+        return a1, None, None
+    input_sf = (
+        quant_config.a1_gscale if quant_config.use_nvfp4_w4a4 else quant_config.a1_scale
+    )
+    # Scale swizzling pads to multiples of 128 rows, which would break the
+    # per-token split; swizzle after the dispatch instead.
+    a1q, a1q_scale = moe_kernel_quantize_input(
+        a1,
+        input_sf,
+        quant_dtype=quant_config.quant_dtype,
+        per_act_token_quant=quant_config.per_act_token_quant,
+        block_shape=quant_config.block_shape,
+        is_scale_swizzled=False,
+        mx_alignment=getattr(quant_config, "mx_alignment", 0),
+    )
+    per_row = (
+        a1q_scale is not None
+        and a1q_scale.ndim > 0
+        and a1q_scale.shape[0] == a1.shape[0]
+    )
+    return a1q, (a1q_scale if per_row else None), a1q_scale
+
+
+def _scale_after_dispatch(
+    recv_scale: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    quant_config: FusedMoEQuantConfig,
+) -> torch.Tensor | None:
+    if recv_scale is None:
+        return scale
+    if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
+        if recv_scale.element_size() == 1:
+            recv_scale = recv_scale.view(torch.uint8)
+        recv_scale = nvfp4_block_scale_interleave(recv_scale)
+    return recv_scale
 
 
 def _noop_hook() -> None:
@@ -130,6 +180,13 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
+        a1q, scale_to_send, a1q_scale = _quantize_for_dispatch(
+            a1, quant_config, defer_input_quant
+        )
+        tensors: list[torch.Tensor] = [a1q, topk_ids, topk_weights]
+        if scale_to_send is not None:
+            tensors.append(scale_to_send)
+
         slot = dbo_current_ubatch_id()
         # DEBUG(p2p_nccl): remove after GPU validation.
         if _DEBUG and self._num_prepares < 8:
@@ -147,18 +204,11 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         dbo_yield_and_switch_from_compute_to_comm()
         self.engine.exchange_counts(pending)
         plan = self.engine.finish_plan(pending)
-        recv_a1, recv_ids, recv_weights = self.engine.dispatch(
-            plan, (a1, topk_ids, topk_weights)
-        )
+        received = self.engine.dispatch(plan, tuple(tensors))
+        recv_a1, recv_ids, recv_weights = received[0], received[1], received[2]
+        recv_scale = received[3] if scale_to_send is not None else None
         self._plans[slot] = plan
         dbo_switch_to_compute_sync()
-
-        quantize_after = quant_config.quant_dtype is not None and not defer_input_quant
-        a1_scale = (
-            quant_config.a1_gscale
-            if quant_config.quant_dtype == "nvfp4"
-            else quant_config.a1_scale
-        )
 
         def receiver() -> mk.PrepareResultType:
             # Slots of experts that live on other ranks: point them at an
@@ -191,19 +241,8 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 is_local, recv_weights, torch.zeros_like(recv_weights)
             )
 
-            a1q: torch.Tensor = recv_a1
-            a1q_scale: torch.Tensor | None = None
-            if quantize_after and recv_a1.numel() != 0:
-                a1q, a1q_scale = moe_kernel_quantize_input(
-                    recv_a1,
-                    a1_scale,
-                    quant_dtype=quant_config.quant_dtype,
-                    per_act_token_quant=quant_config.per_act_token_quant,
-                    block_shape=quant_config.block_shape,
-                    is_scale_swizzled=quant_config.is_scale_swizzled,
-                    mx_alignment=getattr(quant_config, "mx_alignment", 0),
-                )
-            return a1q, a1q_scale, None, expert_topk_ids, expert_topk_weights
+            recv_a1q_scale = _scale_after_dispatch(recv_scale, a1q_scale, quant_config)
+            return recv_a1, recv_a1q_scale, None, expert_topk_ids, expert_topk_weights
 
         return _noop_hook, receiver
 

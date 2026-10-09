@@ -19,6 +19,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.distributed.device_communicators.p2p_nccl_all2all import _FP8_DTYPES
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
@@ -40,6 +41,9 @@ class PreroutedPrepareAndFinalize(MoEPrepareAndFinalizeNoDPEPModular):
         self.rank = rank
         self.rank_expert_offset = rank * num_local_experts
         self._num_dispatchers = num_dispatchers
+        # Set by the external transport when the activations arrive already
+        # quantized (scale with one row per token). Consumed by the next prepare.
+        self.prequantized_scale: torch.Tensor | None = None
 
     def num_dispatchers(self) -> int:
         return self._num_dispatchers
@@ -63,16 +67,24 @@ class PreroutedPrepareAndFinalize(MoEPrepareAndFinalizeNoDPEPModular):
                 f"layer has {num_experts} experts, backend was built for "
                 f"{self.num_experts}"
             )
-        a1q, a1q_scale, _, _, _ = super().prepare(
-            a1,
-            topk_weights,
-            topk_ids,
-            num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-            quant_config,
-            defer_input_quant,
-        )
+        if self.prequantized_scale is not None or a1.dtype in _FP8_DTYPES:
+            # The transport delivered quantized activations; do not re-quantize.
+            assert not apply_router_weight_on_input, (
+                "prerouted: apply_router_weight_on_input with pre-quantized input"
+            )
+            a1q, a1q_scale = a1, self.prequantized_scale
+            self.prequantized_scale = None
+        else:
+            a1q, a1q_scale, _, _, _ = super().prepare(
+                a1,
+                topk_weights,
+                topk_ids,
+                num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+                quant_config,
+                defer_input_quant,
+            )
         # Slots of experts that live on other ranks: point them at an expert
         # this rank does not own so that expert_map yields -1, and drop their
         # routing weight so they contribute nothing to the local partial sum.
