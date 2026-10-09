@@ -68,6 +68,12 @@ def _as_wire(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _current_stream(device: torch.device) -> torch.cuda.Stream | None:
+    if device.type != "cuda":
+        return None
+    return torch.cuda.current_stream(device)
+
+
 @dataclass
 class P2pAll2AllPlan:
     """Host-side description of one dispatch/combine round."""
@@ -242,12 +248,14 @@ class P2pAll2AllEngine:
         key = (slot, name, tuple(tail), dtype)
         buf = self._buffers.get(key)
         if buf is None:
-            buf = torch.empty(
-                (max(self.capacity, rows), *tail), dtype=dtype, device=self.device
-            )
+            # Buffers first used with zero rows (receive buffers of ranks that
+            # own no experts, send buffers of ranks without tokens) stay
+            # empty; the others start at the configured capacity.
+            initial = max(self.capacity, rows) if rows > 0 else 0
+            buf = torch.empty((initial, *tail), dtype=dtype, device=self.device)
             self._buffers[key] = buf
         elif buf.shape[0] < rows:
-            new_rows = max(rows, 2 * buf.shape[0])
+            new_rows = max(rows, 2 * buf.shape[0], self.capacity)
             logger.info(
                 "p2p_nccl[r%d] growing buffer %s (slot %d) from %d to %d rows",
                 self.rank, name, slot, buf.shape[0], new_rows,
@@ -268,12 +276,21 @@ class P2pAll2AllEngine:
         the same slot.
         """
         outputs: list[torch.Tensor] = []
+        stream = _current_stream(self.device)
+        if stream is not None:
+            # The inputs may have been produced on another stream (dual batch
+            # overlap runs this on the communication stream while the tensors
+            # were allocated on the compute stream). Keep their memory from
+            # being reused until this stream is done reading them.
+            plan.perm.record_stream(stream)
         for i, x in enumerate(tensors):
             if x.shape[0] != plan.num_tokens:
                 raise ValueError(
                     f"tensor {i} has {x.shape[0]} rows, plan has {plan.num_tokens}"
                 )
             xw = _as_wire(x)
+            if stream is not None:
+                xw.record_stream(stream)
             tail = tuple(xw.shape[1:])
             packed = self._buffer(plan.slot, f"send{i}", plan.num_send, tail, xw.dtype)
             torch.index_select(xw, 0, plan.perm, out=packed)
@@ -317,9 +334,15 @@ class P2pAll2AllEngine:
             )
         tail = tuple(partial.shape[1:])
         back = self._buffer(plan.slot, "back", plan.num_send, tail, partial.dtype)
+        partial = partial.contiguous()
+        stream = _current_stream(self.device)
+        if stream is not None:
+            # Same cross-stream hazard as in dispatch(): ``partial`` was
+            # computed on the compute stream.
+            partial.record_stream(stream)
         dist.all_to_all_single(
             back,
-            partial.contiguous(),
+            partial,
             output_split_sizes=plan.send_counts,
             input_split_sizes=plan.recv_counts,
             group=self.combine_group,

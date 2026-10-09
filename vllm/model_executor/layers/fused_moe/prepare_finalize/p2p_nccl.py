@@ -14,7 +14,10 @@ When the experts kernel wants quantized inputs, activations are quantized
 before the dispatch and the quantized values travel on the wire (8-bit
 tensors are sent as uint8 views). Per-token or per-group scales are sent
 along as an extra tensor; static scales are replicated on every rank and are
-not sent.
+not sent. The one exception is a dynamic per-tensor scale (fp8/int8 without
+static input scale, block shape or per-token quantization): it depends on
+the sender's batch, so those activations travel unquantized and are
+quantized after the dispatch, as the DeepEP backend does.
 
 Dual batch overlap: ``prepare_async``/``finalize_async`` follow the DeepEP
 pattern. The count exchange is queued on the communication stream and the
@@ -60,6 +63,27 @@ logger = init_logger(__name__)
 _DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
 
 
+def quantize_before_dispatch(quant_config: FusedMoEQuantConfig) -> bool:
+    """Whether the activations can be quantized on the sending rank.
+
+    Scales that are static (replicated on every rank) or that have one row
+    per token (per-token, per-block, nvfp4/mxfp4 groups) survive the
+    dispatch. A dynamic per-tensor scale (fp8/int8 without a static input
+    scale, block shape or per-token quantization) depends on the sender's
+    whole batch and is not sent, so those activations travel unquantized and
+    are quantized on the receiving rank, as the DeepEP backend does.
+    """
+    quant_dtype = quant_config.quant_dtype
+    if quant_dtype is None:
+        return False
+    if isinstance(quant_dtype, str):
+        # nvfp4 / mxfp4: per-group scales with a static global scale.
+        return True
+    if quant_config.per_act_token_quant or quant_config.block_shape is not None:
+        return True
+    return quant_config.a1_scale is not None
+
+
 def _quantize_for_dispatch(
     a1: torch.Tensor,
     quant_config: FusedMoEQuantConfig,
@@ -69,9 +93,11 @@ def _quantize_for_dispatch(
 
     Returns ``(a1q, scale_to_send, scale)``. ``scale_to_send`` is the scale
     tensor when it has one row per token (it travels with the tokens),
-    otherwise ``None`` (static scale, replicated on every rank).
+    otherwise ``None`` (static scale, replicated on every rank). When the
+    quantization cannot happen on the sender (see
+    ``quantize_before_dispatch``) ``a1`` is returned unchanged.
     """
-    if defer_input_quant or quant_config.quant_dtype is None:
+    if defer_input_quant or not quantize_before_dispatch(quant_config):
         return a1, None, None
     input_sf = (
         quant_config.a1_gscale if quant_config.use_nvfp4_w4a4 else quant_config.a1_scale
@@ -93,6 +119,24 @@ def _quantize_for_dispatch(
         and a1q_scale.shape[0] == a1.shape[0]
     )
     return a1q, (a1q_scale if per_row else None), a1q_scale
+
+
+def _quantize_after_dispatch(
+    recv_a1: torch.Tensor,
+    quant_config: FusedMoEQuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Quantize received rows whose scale could not travel (see above)."""
+    if recv_a1.numel() == 0:
+        return recv_a1, None
+    return moe_kernel_quantize_input(
+        recv_a1,
+        quant_config.a1_scale,
+        quant_dtype=quant_config.quant_dtype,
+        per_act_token_quant=quant_config.per_act_token_quant,
+        block_shape=quant_config.block_shape,
+        is_scale_swizzled=quant_config.is_scale_swizzled,
+        mx_alignment=getattr(quant_config, "mx_alignment", 0),
+    )
 
 
 def _scale_after_dispatch(
@@ -183,6 +227,11 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1q, scale_to_send, a1q_scale = _quantize_for_dispatch(
             a1, quant_config, defer_input_quant
         )
+        quantize_on_receive = (
+            a1q is a1
+            and not defer_input_quant
+            and quant_config.quant_dtype is not None
+        )
         tensors: list[torch.Tensor] = [a1q, topk_ids, topk_weights]
         if scale_to_send is not None:
             tensors.append(scale_to_send)
@@ -192,10 +241,12 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if _DEBUG and self._num_prepares < 8:
             logger.info(
                 "p2p_nccl P/F rank=%d prepare#%d dbo=%s slot=%d T=%d topk=%d "
-                "ids_dtype=%s quant_dtype=%s defer_input_quant=%s",
+                "ids_dtype=%s quant_dtype=%s defer_input_quant=%s wire_dtype=%s "
+                "quantize_on_receive=%s",
                 self.rank, self._num_prepares, dbo_enabled(), slot,
                 a1.shape[0], topk_ids.shape[1], topk_ids.dtype,
-                quant_config.quant_dtype, defer_input_quant,
+                quant_config.quant_dtype, defer_input_quant, a1q.dtype,
+                quantize_on_receive,
             )
         self._num_prepares += 1
         pending = self.engine.begin_plan(topk_ids, slot)
@@ -241,6 +292,18 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 is_local, recv_weights, torch.zeros_like(recv_weights)
             )
 
+            if quantize_on_receive:
+                # Dynamic per-tensor scale: quantize the received rows here.
+                recv_a1q, recv_a1q_scale = _quantize_after_dispatch(
+                    recv_a1, quant_config
+                )
+                return (
+                    recv_a1q,
+                    recv_a1q_scale,
+                    None,
+                    expert_topk_ids,
+                    expert_topk_weights,
+                )
             recv_a1q_scale = _scale_after_dispatch(recv_scale, a1q_scale, quant_config)
             return recv_a1, recv_a1q_scale, None, expert_topk_ids, expert_topk_weights
 
