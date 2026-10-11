@@ -1069,7 +1069,7 @@ class P2pNcclAll2AllManager(All2AllManagerBase):
             )
             if max_tokens_per_rank > self._engine.max_tokens_per_rank:
                 self._engine.max_tokens_per_rank = max_tokens_per_rank
-                self._engine.capacity = max_tokens_per_rank * self.world_size
+                self._engine.capacity = max_tokens_per_rank
         return self._engine
 
     def dispatch_router_logits(self, *args, **kwargs):

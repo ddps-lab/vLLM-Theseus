@@ -327,6 +327,13 @@ def maybe_make_prepare_finalize(
                 "all2all_backend=p2p_nccl assumes a contiguous expert "
                 "placement and does not support EPLB yet."
             )
+        if moe.num_experts % moe.moe_parallel_config.ep_size != 0:
+            raise NotImplementedError(
+                "all2all_backend=p2p_nccl maps expert ids to ranks as "
+                "id // num_local_experts, which needs num_experts "
+                f"({moe.num_experts}) divisible by ep_size "
+                f"({moe.moe_parallel_config.ep_size})."
+            )
         if moe.moe_parallel_config.is_sequence_parallel:
             raise NotImplementedError(
                 "all2all_backend=p2p_nccl does not support sequence-parallel MoE."
@@ -350,6 +357,13 @@ def maybe_make_prepare_finalize(
             raise NotImplementedError(
                 "all2all_backend=prerouted assumes a contiguous expert "
                 "placement and does not support EPLB."
+            )
+        if moe.num_experts % moe.moe_parallel_config.ep_size != 0:
+            raise NotImplementedError(
+                "all2all_backend=prerouted maps expert ids to ranks as "
+                "id // num_local_experts, which needs num_experts "
+                f"({moe.num_experts}) divisible by ep_size "
+                f"({moe.moe_parallel_config.ep_size})."
             )
         if moe.moe_parallel_config.is_sequence_parallel:
             raise NotImplementedError(
