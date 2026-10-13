@@ -1021,7 +1021,7 @@ class VllmConfig:
         executor_supports_async_sched = executor_class.supports_async_scheduling()
         uses_rocm_deepep_ht_dbo = (
             current_platform.is_rocm()
-            and self.parallel_config.enable_dbo
+            and self.parallel_config.use_ubatching
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 

@@ -51,7 +51,14 @@ class SharedExperts(torch.nn.Module):
         # DBO ubatch id to handle this case.  If DBO is not enabled, the
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
-        self._output: list[torch.Tensor | None] = [None, None]
+        # 슬롯 수는 마이크로배치 수(--enable-dbo 는 2, --ubatch-size N 은 N)를 따른다.
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        num_slots = 1
+        if vllm_config is not None and vllm_config.parallel_config.use_ubatching:
+            num_slots = vllm_config.parallel_config.num_ubatches
+        self._output: list[torch.Tensor | None] = [None] * max(2, num_slots)
         self._layer = layer
         self._moe_config = moe_config
 
