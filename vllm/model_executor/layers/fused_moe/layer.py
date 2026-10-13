@@ -402,7 +402,8 @@ def FusedMoE(
         moe_config=moe_config,
         router=router,
         routed_experts=routed_experts,
-        enable_dbo=vllm_config.parallel_config.enable_dbo,
+        # [theseus ubatch] was enable_dbo; --ubatch-size N also micro-batches
+        enable_dbo=vllm_config.parallel_config.use_ubatching,
         gate=gate,
         shared_expert_gate=shared_expert_gate,
         shared_experts=shared_experts,
