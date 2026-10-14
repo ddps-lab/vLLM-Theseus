@@ -22,6 +22,7 @@ vLLM provides multiple communication backends for EP. Use `--all2all-backend` to
 | `deepep_high_throughput` | Multi-node prefill | Grouped GEMM with continuous layout, optimized for prefill | Prefill-dominated workloads, high-throughput scenarios |
 | `deepep_low_latency` | Multi-node decode | CUDA graph support, masked layout, optimized for decode | Decode-dominated workloads, low-latency scenarios |
 | `p2p_nccl` | Multi-node without RDMA (Theseus) | Point-to-point NCCL send/recv to the ranks that own the selected experts, one count exchange per layer, micro-batch overlap via `--ubatch-size N` | Low-bandwidth / TCP-only clusters, no DeepEP install; eager mode only |
+| `prerouted` | AFD FFN role (Theseus) | No all2all: tokens arrive already routed to the rank that owns their experts (external transport), the rank returns per-token partial sums over its local experts | FFN ranks behind the afd-plugin routed connector; not useful on its own |
 | `flashinfer_nvlink_one_sided` | MNNVL systems | FlashInfer's one-sided A2A strategy for multi-node NVLink | High-throughput workloads |
 | `flashinfer_nvlink_two_sided` | MNNVL systems | FlashInfer's two-sided A2A strategy for multi-node NVLink | Systems with NVLink across nodes |
 
@@ -48,6 +49,23 @@ Notes:
 - Activations are quantized before the dispatch when the experts kernel wants quantized inputs (fp8 travels as 8-bit); dynamic per-tensor scales are the exception and are applied after the dispatch.
 - `VLLM_P2P_NCCL_DEBUG=1` logs per-layer plan/dispatch sizes, `2` additionally validates the received expert ids (slow, validation only).
 - Implementation: `vllm/distributed/device_communicators/p2p_nccl_all2all.py` (engine) and `vllm/model_executor/layers/fused_moe/prepare_finalize/p2p_nccl.py` (prepare/finalize). Fork changes are marked with `# [theseus p2p_nccl]` / `# [theseus ubatch]`.
+
+### `prerouted` (added by Theseus)
+
+Expert-parallel backend for ranks whose tokens were already delivered by an
+external transport, such as the FFN role of the afd-plugin routed
+(one-hop attention-to-expert) connector. No communication happens inside vLLM:
+slots of experts owned by other ranks are masked out, the local experts kernel
+runs unchanged, and the output is the per-token partial sum over the local
+experts; the transport sums the partials of the different ranks on the token
+owner.
+
+Notes:
+
+- Selected on the FFN side with `--data-parallel-size F --enable-expert-parallel --all2all-backend prerouted`.
+- `num_experts` must be divisible by the EP size; EPLB and sequence-parallel MoE are not supported.
+- Activations that the transport quantized on the sender are handed over with `PreroutedPrepareAndFinalize.set_prequantized` before the forward.
+- Implementation: `vllm/model_executor/layers/fused_moe/prepare_finalize/prerouted.py`. Fork changes in upstream files are marked with `# [theseus prerouted]`.
 
 ## Single Node Deployment
 

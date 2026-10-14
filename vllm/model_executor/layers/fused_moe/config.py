@@ -1099,6 +1099,11 @@ class FusedMoEParallelConfig:
     def use_p2p_nccl_kernels(self):
         return self.use_all2all_kernels and self.all2all_backend == "p2p_nccl"
 
+    # [theseus prerouted]
+    @property
+    def use_prerouted_kernels(self):
+        return self.use_all2all_kernels and self.all2all_backend == "prerouted"
+
     @property
     def use_mori_kernels(self):
         return self.use_all2all_kernels and self.all2all_backend in (
@@ -1448,6 +1453,11 @@ class FusedMoEConfig:
     @property
     def use_p2p_nccl_kernels(self):
         return self.moe_parallel_config.use_p2p_nccl_kernels
+
+    # [theseus prerouted]
+    @property
+    def use_prerouted_kernels(self):
+        return self.moe_parallel_config.use_prerouted_kernels
 
     @property
     def use_nixl_ep_kernels(self):
