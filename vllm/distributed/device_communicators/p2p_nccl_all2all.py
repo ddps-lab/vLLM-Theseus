@@ -52,7 +52,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger("vllm.distributed.device_communicators.p2p_nccl_all2all")
 
-# DEBUG(p2p_nccl): remove after GPU validation. VLLM_P2P_NCCL_DEBUG=1 logs
+# DEBUG(p2p_nccl): off by default. VLLM_P2P_NCCL_DEBUG=1 logs
 # per-layer counts, bytes and host-wait time (first 8 calls, then every 64th);
 # =2 additionally runs sanity checks that synchronize with the device.
 _DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
@@ -229,7 +229,7 @@ class P2pAll2AllEngine:
             seq=seq,
             host_wait_ms=host_wait_ms,
         )
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(seq):
             logger.info(
                 "p2p_nccl[r%d] plan#%d slot=%d T=%d send=%s recv=%s "
@@ -317,7 +317,7 @@ class P2pAll2AllEngine:
                 group=self.group,
             )
             outputs.append(recv.view(x.dtype) if xw is not x else recv)
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(plan.seq):
             row_bytes = sum(
                 math.prod(x.shape[1:]) * x.element_size() for x in tensors
