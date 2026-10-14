@@ -197,6 +197,12 @@ class P2pAll2AllEngine:
         host_wait_ms = (time.perf_counter() - t0) * 1e3
         num_send = sum(send_counts)
         num_tokens = pending.num_tokens
+        stream = _current_stream(self.device)
+        if stream is not None:
+            # ``order`` was produced on the stream that ran begin_plan (the
+            # compute stream under dual batch overlap) and is read here on the
+            # current one; keep its memory from being reused before that read.
+            pending.order.record_stream(stream)
         perm = (
             pending.order[:num_send] % num_tokens
             if num_tokens > 0
