@@ -1021,7 +1021,7 @@ class VllmConfig:
         executor_supports_async_sched = executor_class.supports_async_scheduling()
         uses_rocm_deepep_ht_dbo = (
             current_platform.is_rocm()
-            and self.parallel_config.enable_dbo
+            and self.parallel_config.use_ubatching  # [theseus ubatch] was enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 
@@ -1528,19 +1528,34 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        # [theseus p2p_nccl] the per-layer count exchange is a host sync
+        if (
+            self.parallel_config.all2all_backend == "p2p_nccl"
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            logger.warning(
+                "all2all_backend=p2p_nccl exchanges per-destination token counts "
+                "with the host in every MoE layer, which cannot be captured in a "
+                "CUDA graph. Disabling CUDA graphs (equivalent to "
+                "-cc.cudagraph_mode=none)."
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "nixl_ep",
+                "p2p_nccl",  # [theseus p2p_nccl]
             ], (
                 "Microbatching currently only supports the deepep_low_latency, "
-                "deepep_high_throughput, and nixl_ep all2all backends. "
+                "deepep_high_throughput, nixl_ep, and p2p_nccl all2all backends. "
                 f"{a2a_backend} is not supported. To fix use "
                 "--all2all-backend=deepep_low_latency, "
-                "--all2all-backend=deepep_high_throughput, or "
-                "--all2all-backend=nixl_ep and install the matching kernels."
+                "--all2all-backend=deepep_high_throughput, "
+                "--all2all-backend=nixl_ep (and install the matching kernels), "
+                "or --all2all-backend=p2p_nccl."
             )
 
             if not self.model_config.disable_cascade_attn:

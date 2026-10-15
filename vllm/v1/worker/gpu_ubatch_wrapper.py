@@ -156,7 +156,7 @@ class UBatchWrapper:
         comm_sms: int = envs.VLLM_DBO_COMM_SMS
         rocm_deepep_ht_dbo = (
             current_platform.is_rocm()
-            and vllm_config.parallel_config.enable_dbo
+            and vllm_config.parallel_config.use_ubatching  # [theseus ubatch]
             and vllm_config.parallel_config.all2all_backend == "deepep_high_throughput"
         )
         if rocm_deepep_ht_dbo:

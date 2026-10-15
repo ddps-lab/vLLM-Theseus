@@ -123,7 +123,11 @@ class XPUWorker(Worker):
         )
 
         # Initialize workspace manager
-        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        # [theseus ubatch] --ubatch-size N needs N slots, not only --enable-dbo's 2.
+        parallel_config = self.vllm_config.parallel_config
+        num_ubatches = (
+            parallel_config.num_ubatches if parallel_config.use_ubatching else 1
+        )
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
