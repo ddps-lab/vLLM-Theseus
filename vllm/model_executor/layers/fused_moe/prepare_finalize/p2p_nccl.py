@@ -20,10 +20,12 @@ the sender's batch, so those activations travel unquantized and are
 quantized after the dispatch, as the DeepEP backend does.
 
 Dual batch overlap: ``prepare_async``/``finalize_async`` follow the DeepEP
-pattern. The count exchange is queued on the communication stream and the
-thread yields to the other micro-batch *before* the host copy of the counts,
-so the GPU has the other micro-batch's work to run while the counts travel.
-Each micro-batch uses its own engine slot (buffers and counts).
+normal-mode pattern. The thread yields to the other micro-batch *before*
+posting the count exchange and blocking on the host copy of the counts, so
+the other micro-batch's compute is already queued while this thread waits,
+and each micro-batch's dispatch directly follows its own count exchange on
+the communicator. Each micro-batch uses its own engine slot (buffers and
+counts).
 """
 
 from __future__ import annotations
@@ -50,10 +52,8 @@ from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
     dbo_switch_to_comm,
-    dbo_switch_to_comm_sync,
     dbo_switch_to_compute,
     dbo_switch_to_compute_sync,
-    dbo_yield,
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
@@ -251,15 +251,15 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
         self._num_prepares += 1
         pending = self.engine.begin_plan(topk_ids, slot)
-        # Under DBO: move to the communication stream (ordered after this
-        # micro-batch's compute), post the count exchange, and only then hand
-        # the CPU to the other micro-batch, so the counts travel while it
-        # launches its work and the host copy in finish_plan finds them
-        # ready. Yielding before the post left the CPU idle for the whole
-        # round trip. Without DBO these calls are no-ops.
-        dbo_switch_to_comm_sync()
+        # Under DBO: hand the CPU to the other micro-batch first, then move
+        # to the communication stream and post the count exchange, whose host
+        # copy blocks the CPU. Yielding first queues the other micro-batch's
+        # compute before this thread blocks, and keeps the communicator order
+        # "exchange(i), dispatch(i)" so the dispatch of this micro-batch is
+        # not queued behind the other's count exchange -- the same order as
+        # vLLM's DeepEP normal path. Without DBO these calls are no-ops.
+        dbo_yield_and_switch_from_compute_to_comm()
         self.engine.exchange_counts(pending)
-        dbo_yield()
         plan = self.engine.finish_plan(pending)
         received = self.engine.dispatch(plan, tuple(tensors))
         recv_a1, recv_ids, recv_weights = received[0], received[1], received[2]
