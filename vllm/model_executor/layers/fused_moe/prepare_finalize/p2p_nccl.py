@@ -38,24 +38,25 @@ from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllEngine,
     P2pAll2AllPlan,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
     dbo_switch_to_comm,
+    dbo_switch_to_comm_sync,
     dbo_switch_to_compute,
     dbo_switch_to_compute_sync,
+    dbo_yield,
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
-
 
 logger = init_logger(__name__)
 
@@ -250,10 +251,15 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
         self._num_prepares += 1
         pending = self.engine.begin_plan(topk_ids, slot)
-        # Under DBO: hand the CPU to the other micro-batch and move to the
-        # communication stream. Without DBO these calls are no-ops.
-        dbo_yield_and_switch_from_compute_to_comm()
+        # Under DBO: move to the communication stream (ordered after this
+        # micro-batch's compute), post the count exchange, and only then hand
+        # the CPU to the other micro-batch, so the counts travel while it
+        # launches its work and the host copy in finish_plan finds them
+        # ready. Yielding before the post left the CPU idle for the whole
+        # round trip. Without DBO these calls are no-ops.
+        dbo_switch_to_comm_sync()
         self.engine.exchange_counts(pending)
+        dbo_yield()
         plan = self.engine.finish_plan(pending)
         received = self.engine.dispatch(plan, tuple(tensors))
         recv_a1, recv_ids, recv_weights = received[0], received[1], received[2]
@@ -262,50 +268,38 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         dbo_switch_to_compute_sync()
 
         def receiver() -> mk.PrepareResultType:
-            # Slots of experts that live on other ranks: point them at an
-            # expert this rank does not own so that expert_map yields -1, and
-            # drop their routing weight so they contribute nothing locally.
-            is_local = (
-                torch.div(
-                    recv_ids.to(torch.int64),
-                    self.num_local_experts,
-                    rounding_mode="floor",
-                )
-                == self.rank
-            )
-            # DEBUG(p2p_nccl): remove after GPU validation. Level 2 checks
+            # The ids are global and the experts kernel skips the slots whose
+            # expert_map entry is -1 (align/sum kernels and the Triton kernel
+            # all do), so the received ids and weights pass through as they
+            # are, as in the allgather/reduce-scatter path.
+            # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG=2; these checks
             # synchronize with the device.
             if _DEBUG >= 2 and recv_ids.numel() > 0:
                 lo, hi = int(recv_ids.min()), int(recv_ids.max())
-                assert 0 <= lo and hi < self.num_experts, (
+                assert lo >= 0 and hi < self.num_experts, (
                     f"p2p_nccl: received expert ids out of range [{lo}, {hi}]"
+                )
+                is_local = (
+                    torch.div(
+                        recv_ids.to(torch.int64),
+                        self.num_local_experts,
+                        rounding_mode="floor",
+                    )
+                    == self.rank
                 )
                 assert bool(is_local.any(dim=1).all()), (
                     "p2p_nccl: received a token that selects none of this "
                     "rank's experts"
                 )
-            foreign = self.num_experts - 1 if self.rank_expert_offset == 0 else 0
-            expert_topk_ids = torch.where(
-                is_local, recv_ids, torch.full_like(recv_ids, foreign)
-            )
-            expert_topk_weights = torch.where(
-                is_local, recv_weights, torch.zeros_like(recv_weights)
-            )
 
             if quantize_on_receive:
                 # Dynamic per-tensor scale: quantize the received rows here.
                 recv_a1q, recv_a1q_scale = _quantize_after_dispatch(
                     recv_a1, quant_config
                 )
-                return (
-                    recv_a1q,
-                    recv_a1q_scale,
-                    None,
-                    expert_topk_ids,
-                    expert_topk_weights,
-                )
+                return recv_a1q, recv_a1q_scale, None, recv_ids, recv_weights
             recv_a1q_scale = _scale_after_dispatch(recv_scale, a1q_scale, quant_config)
-            return recv_a1, recv_a1q_scale, None, expert_topk_ids, expert_topk_weights
+            return recv_a1, recv_a1q_scale, None, recv_ids, recv_weights
 
         return _noop_hook, receiver
 
