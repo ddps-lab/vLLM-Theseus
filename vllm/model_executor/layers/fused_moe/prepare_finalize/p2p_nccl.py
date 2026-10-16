@@ -20,13 +20,12 @@ the sender's batch, so those activations travel unquantized and are
 quantized after the dispatch, as the DeepEP backend does.
 
 Dual batch overlap: ``prepare_async``/``finalize_async`` follow the DeepEP
-pattern. The count exchange is queued on the communication stream and the
-thread yields to the other micro-batch *before* the host copy of the counts,
-so the GPU has the other micro-batch's work to run while the counts travel.
-Each micro-batch uses its own engine slot (buffers and counts).
-
-Selected with ``--all2all-backend p2p_nccl`` (see ``p2p_nccl_all2all.py`` for
-the flags and limits). ``VLLM_P2P_NCCL_DEBUG`` enables the per-layer logs.
+normal-mode pattern. The thread yields to the other micro-batch *before*
+posting the count exchange and blocking on the host copy of the counts, so
+the other micro-batch's compute is already queued while this thread waits,
+and each micro-batch's dispatch directly follows its own count exchange on
+the communicator. Each micro-batch uses its own engine slot (buffers and
+counts).
 """
 
 from __future__ import annotations
@@ -41,12 +40,12 @@ from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllEngine,
     P2pAll2AllPlan,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 from vllm.v1.worker.ubatching import (
@@ -58,7 +57,6 @@ from vllm.v1.worker.ubatching import (
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
-
 
 logger = init_logger(__name__)
 
@@ -253,8 +251,13 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
         self._num_prepares += 1
         pending = self.engine.begin_plan(topk_ids, slot)
-        # Under DBO: hand the CPU to the other micro-batch and move to the
-        # communication stream. Without DBO these calls are no-ops.
+        # Under DBO: hand the CPU to the other micro-batch first, then move
+        # to the communication stream and post the count exchange, whose host
+        # copy blocks the CPU. Yielding first queues the other micro-batch's
+        # compute before this thread blocks, and keeps the communicator order
+        # "exchange(i), dispatch(i)" so the dispatch of this micro-batch is
+        # not queued behind the other's count exchange -- the same order as
+        # vLLM's DeepEP normal path. Without DBO these calls are no-ops.
         dbo_yield_and_switch_from_compute_to_comm()
         self.engine.exchange_counts(pending)
         plan = self.engine.finish_plan(pending)
@@ -265,50 +268,38 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         dbo_switch_to_compute_sync()
 
         def receiver() -> mk.PrepareResultType:
-            # Slots of experts that live on other ranks: point them at an
-            # expert this rank does not own so that expert_map yields -1, and
-            # drop their routing weight so they contribute nothing locally.
-            is_local = (
-                torch.div(
-                    recv_ids.to(torch.int64),
-                    self.num_local_experts,
-                    rounding_mode="floor",
-                )
-                == self.rank
-            )
-            # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG=2. Level 2 checks
+            # The ids are global and the experts kernel skips the slots whose
+            # expert_map entry is -1 (align/sum kernels and the Triton kernel
+            # all do), so the received ids and weights pass through as they
+            # are, as in the allgather/reduce-scatter path.
+            # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG=2; these checks
             # synchronize with the device.
             if _DEBUG >= 2 and recv_ids.numel() > 0:
                 lo, hi = int(recv_ids.min()), int(recv_ids.max())
-                assert 0 <= lo and hi < self.num_experts, (
+                assert lo >= 0 and hi < self.num_experts, (
                     f"p2p_nccl: received expert ids out of range [{lo}, {hi}]"
+                )
+                is_local = (
+                    torch.div(
+                        recv_ids.to(torch.int64),
+                        self.num_local_experts,
+                        rounding_mode="floor",
+                    )
+                    == self.rank
                 )
                 assert bool(is_local.any(dim=1).all()), (
                     "p2p_nccl: received a token that selects none of this "
                     "rank's experts"
                 )
-            foreign = self.num_experts - 1 if self.rank_expert_offset == 0 else 0
-            expert_topk_ids = torch.where(
-                is_local, recv_ids, torch.full_like(recv_ids, foreign)
-            )
-            expert_topk_weights = torch.where(
-                is_local, recv_weights, torch.zeros_like(recv_weights)
-            )
 
             if quantize_on_receive:
                 # Dynamic per-tensor scale: quantize the received rows here.
                 recv_a1q, recv_a1q_scale = _quantize_after_dispatch(
                     recv_a1, quant_config
                 )
-                return (
-                    recv_a1q,
-                    recv_a1q_scale,
-                    None,
-                    expert_topk_ids,
-                    expert_topk_weights,
-                )
+                return recv_a1q, recv_a1q_scale, None, recv_ids, recv_weights
             recv_a1q_scale = _scale_after_dispatch(recv_scale, a1q_scale, quant_config)
-            return recv_a1, recv_a1q_scale, None, expert_topk_ids, expert_topk_weights
+            return recv_a1, recv_a1q_scale, None, recv_ids, recv_weights
 
         return _noop_hook, receiver
 
