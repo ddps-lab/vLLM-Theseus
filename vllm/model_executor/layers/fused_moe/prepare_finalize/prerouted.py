@@ -103,12 +103,16 @@ class PreroutedPrepareAndFinalize(MoEPrepareAndFinalizeNoDPEPModular):
         # Slots of experts that live on other ranks: point them at an expert
         # this rank does not own so that expert_map yields -1, and drop their
         # routing weight so they contribute nothing to the local partial sum.
-        is_local = (
-            torch.div(
-                topk_ids.to(torch.int64), self.num_local_experts, rounding_mode="floor"
+        ids = topk_ids.to(torch.int64)
+        if expert_map is not None:
+            # Follows any placement, including uneven expert_placement_counts.
+            # Padding ids (< 0) must not index the map from its end.
+            is_local = (ids >= 0) & (expert_map[ids.clamp(min=0)] >= 0)
+        else:
+            is_local = (
+                torch.div(ids, self.num_local_experts, rounding_mode="floor")
+                == self.rank
             )
-            == self.rank
-        )
         foreign = self.num_experts - 1 if self.rank_expert_offset == 0 else 0
         expert_topk_ids = torch.where(
             is_local, topk_ids, torch.full_like(topk_ids, foreign)

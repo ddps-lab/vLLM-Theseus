@@ -63,9 +63,23 @@ owner.
 Notes:
 
 - Selected on the FFN side with `--data-parallel-size F --enable-expert-parallel --all2all-backend prerouted`.
-- `num_experts` must be divisible by the EP size; EPLB and sequence-parallel MoE are not supported.
+- `num_experts` must be divisible by the EP size unless `--expert-placement-counts` is set; EPLB and sequence-parallel MoE are not supported.
 - Activations that the transport quantized on the sender are handed over with `PreroutedPrepareAndFinalize.set_prequantized` before the forward.
 - Implementation: `vllm/model_executor/layers/fused_moe/prepare_finalize/prerouted.py`. Fork changes in upstream files are marked with `# [theseus prerouted]`.
+
+### `--expert-placement-counts` (added by Theseus)
+
+Places a given number of routed experts on each EP rank instead of an even
+split, in rank order and contiguously (`48 16` puts experts [0, 48) on rank 0
+and [48, 64) on rank 1). Weights are allocated and loaded per these counts, and
+the experts kernel finds its local experts through `expert_map`.
+
+Notes:
+
+- Works with the `allgather_reducescatter` and `prerouted` backends and linear placement; EPLB and elastic EP are rejected.
+- Uneven counts require `--moe-backend triton`; other kernels locate their experts as `ep_rank * local_num_experts`.
+- With the afd-plugin routed connector, every Attention and FFN rank gets the same list: the Attention side routes tokens by it (`P2pAll2AllEngine(expert_counts=...)`).
+- Fork changes in upstream files are marked with `# [theseus expert counts]`.
 
 ## Single Node Deployment
 

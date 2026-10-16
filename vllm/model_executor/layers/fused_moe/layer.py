@@ -261,6 +261,16 @@ def FusedMoE(
 
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
+    # [theseus expert counts] Kernels other than Triton locate the local experts as
+    # ep_rank * local_num_experts and ignore an uneven expert_map.
+    placement_counts = vllm_config.parallel_config.expert_placement_counts
+    moe_backend = vllm_config.kernel_config.moe_backend
+    if placement_counts and len(set(placement_counts)) > 1 and moe_backend != "triton":
+        raise ValueError(
+            "Uneven expert_placement_counts require --moe-backend triton, "
+            f"got {moe_backend!r}."
+        )
+
     # Create ExpertMapManager to handle expert mapping and placement for EP.
     # See ExpertMapManager for a detailed description of what it does and when
     # it is required.
@@ -275,6 +285,7 @@ def FusedMoE(
         enable_eplb=eplb_state is not None,
         num_fused_shared_experts=num_fused_shared_experts,
         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
+        placement_counts=placement_counts,
     )
 
     # TODO(bnell): we should not have to create a router if the kernel is
