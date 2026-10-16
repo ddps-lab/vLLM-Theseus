@@ -154,6 +154,14 @@ class P2pAll2AllEngine:
         self._arange_r = torch.arange(world_size, device=self.device)
         self._count_bufs: dict[int, torch.Tensor] = {}
         self._buffers: dict[tuple, torch.Tensor] = {}
+        # Ranks without tokens of their own (the FFN role of a one-hop AFD
+        # deployment) take part in every exchange but skip the plan
+        # arithmetic and the send-side packing: an empty ordering, zero-row
+        # send buffers per wire shape, and the slots whose send counts are
+        # already zero on device.
+        self._empty_order = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._empty_sends: dict[tuple, torch.Tensor] = {}
+        self._zero_send_slots: set[int] = set()
         self._num_plans = 0
 
     # ------------------------------------------------------------------ plan
@@ -171,6 +179,19 @@ class P2pAll2AllEngine:
         num_tokens = topk_ids.shape[0]
         world = self.world_size
         device = self.device
+
+        if num_tokens == 0:
+            # Nothing to send: zero the send counts once per slot (they stay
+            # zero until a call with tokens overwrites them) and skip the
+            # destination/ordering arithmetic, which would run ~20 kernels
+            # on empty tensors every layer on a receive-only rank.
+            if slot not in self._zero_send_slots:
+                self._count_buf(slot)[0].zero_()
+                self._zero_send_slots.add(slot)
+            return P2pAll2AllPendingPlan(
+                slot=slot, num_tokens=0, order=self._empty_order
+            )
+        self._zero_send_slots.discard(slot)
 
         rank_of = torch.div(
             topk_ids.to(torch.int64), self.num_local_experts, rounding_mode="floor"
@@ -206,7 +227,7 @@ class P2pAll2AllEngine:
         num_send = sum(send_counts)
         num_tokens = pending.num_tokens
         stream = _current_stream(self.device)
-        if stream is not None:
+        if stream is not None and num_tokens > 0:
             # ``order`` was produced on the stream that ran begin_plan (the
             # compute stream under dual batch overlap) and is read here on the
             # current one; keep its memory from being reused before that read.
@@ -214,7 +235,7 @@ class P2pAll2AllEngine:
         perm = (
             pending.order[:num_send] % num_tokens
             if num_tokens > 0
-            else pending.order[:0]
+            else self._empty_order
         )
         seq = self._num_plans
         self._num_plans += 1
@@ -278,6 +299,14 @@ class P2pAll2AllEngine:
             self._buffers[key] = buf
         return buf[:rows]
 
+    def _empty_send(self, tail: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        key = (tuple(tail), dtype)
+        buf = self._empty_sends.get(key)
+        if buf is None:
+            buf = torch.empty((0, *tail), dtype=dtype, device=self.device)
+            self._empty_sends[key] = buf
+        return buf
+
     # -------------------------------------------------------------- dispatch
     def dispatch(
         self, plan: P2pAll2AllPlan, tensors: tuple[torch.Tensor, ...]
@@ -291,7 +320,8 @@ class P2pAll2AllEngine:
         """
         outputs: list[torch.Tensor] = []
         stream = _current_stream(self.device)
-        if stream is not None:
+        num_send = plan.num_send
+        if stream is not None and num_send > 0:
             # The inputs may have been produced on another stream (dual batch
             # overlap runs this on the communication stream while the tensors
             # were allocated on the compute stream). Keep their memory from
@@ -302,13 +332,20 @@ class P2pAll2AllEngine:
                 raise ValueError(
                     f"tensor {i} has {x.shape[0]} rows, plan has {plan.num_tokens}"
                 )
-            xw = _as_wire(x)
-            if stream is not None:
-                xw.record_stream(stream)
-            tail = tuple(xw.shape[1:])
-            packed = self._buffer(plan.slot, f"send{i}", plan.num_send, tail, xw.dtype)
-            torch.index_select(xw, 0, plan.perm, out=packed)
-            recv = self._buffer(plan.slot, f"recv{i}", plan.num_recv, tail, xw.dtype)
+            if num_send > 0:
+                xw = _as_wire(x)
+                if stream is not None:
+                    xw.record_stream(stream)
+                wire_dtype = xw.dtype
+                tail = tuple(xw.shape[1:])
+                packed = self._buffer(plan.slot, f"send{i}", num_send, tail, wire_dtype)
+                torch.index_select(xw, 0, plan.perm, out=packed)
+            else:
+                # Receive-only rank: no packing, an empty send of the wire dtype.
+                wire_dtype = torch.uint8 if x.dtype in _FP8_DTYPES else x.dtype
+                tail = tuple(x.shape[1:])
+                packed = self._empty_send(tail, wire_dtype)
+            recv = self._buffer(plan.slot, f"recv{i}", plan.num_recv, tail, wire_dtype)
             dist.all_to_all_single(
                 recv,
                 packed,
@@ -316,7 +353,7 @@ class P2pAll2AllEngine:
                 input_split_sizes=plan.send_counts,
                 group=self.group,
             )
-            outputs.append(recv.view(x.dtype) if xw is not x else recv)
+            outputs.append(recv.view(x.dtype) if wire_dtype != x.dtype else recv)
         # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(plan.seq):
             row_bytes = sum(
@@ -348,12 +385,13 @@ class P2pAll2AllEngine:
             )
         tail = tuple(partial.shape[1:])
         back = self._buffer(plan.slot, "back", plan.num_send, tail, partial.dtype)
-        partial = partial.contiguous()
-        stream = _current_stream(self.device)
-        if stream is not None:
-            # Same cross-stream hazard as in dispatch(): ``partial`` was
-            # computed on the compute stream.
-            partial.record_stream(stream)
+        if plan.num_recv > 0:
+            partial = partial.contiguous()
+            stream = _current_stream(self.device)
+            if stream is not None:
+                # Same cross-stream hazard as in dispatch(): ``partial`` was
+                # computed on the compute stream.
+                partial.record_stream(stream)
         dist.all_to_all_single(
             back,
             partial,
