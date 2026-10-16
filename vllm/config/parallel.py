@@ -47,8 +47,8 @@ All2AllBackend = Literal[
     "mori_low_latency",
     "nixl_ep",
     "allgather_reducescatter",
-    "p2p_nccl",
-    "prerouted",
+    "p2p_nccl",  # [theseus p2p_nccl]
+    "prerouted",  # [theseus prerouted]
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
     "flashinfer_nvlink_one_sided",

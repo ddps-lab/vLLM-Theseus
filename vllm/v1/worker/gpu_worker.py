@@ -395,7 +395,7 @@ class Worker(WorkerBase):
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
         # Initialize workspace manager
-        # --enable-dbo (2) 뿐 아니라 --ubatch-size N 도 슬롯 N 개가 필요하다.
+        # [theseus ubatch] --ubatch-size N needs N slots, not only --enable-dbo's 2.
         parallel_config = self.vllm_config.parallel_config
         num_ubatches = (
             parallel_config.num_ubatches if parallel_config.use_ubatching else 1

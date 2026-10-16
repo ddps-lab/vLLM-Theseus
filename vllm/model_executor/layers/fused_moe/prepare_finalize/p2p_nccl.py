@@ -60,7 +60,7 @@ from vllm.v1.worker.ubatching import (
 
 logger = init_logger(__name__)
 
-# DEBUG(p2p_nccl): remove after GPU validation (see p2p_nccl_all2all.py).
+# DEBUG(p2p_nccl): off by default (see p2p_nccl_all2all.py).
 _DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
 
 
@@ -238,7 +238,7 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             tensors.append(scale_to_send)
 
         slot = dbo_current_ubatch_id()
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and self._num_prepares < 8:
             logger.info(
                 "p2p_nccl P/F rank=%d prepare#%d dbo=%s slot=%d T=%d topk=%d "
@@ -340,7 +340,7 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         slot = dbo_current_ubatch_id()
         plan = self._plans.pop(slot, None)
         assert plan is not None, "finalize called without a matching prepare"
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and plan.seq < 8:
             logger.info(
                 "p2p_nccl P/F rank=%d finalize plan#%d slot=%d expert_out=%s "

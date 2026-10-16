@@ -2444,7 +2444,7 @@ class GPUModelRunner(
         # same metadata builder and KVCacheSpec is the same is the block table, so we
         # can cache the attention metadata builds and just update the block table using
         # `builder.update_block_table` if the builder supports it.
-        # The cache is keyed per ubatch as well: with micro-batching each ubatch
+        # [theseus ubatch] The cache is keyed per ubatch as well: with micro-batching each ubatch
         # has its own CommonAttentionMetadata (query_start_loc, seq_lens, ...),
         # so reusing another ubatch's build and only swapping the block table
         # produces metadata whose block table does not match its query layout.

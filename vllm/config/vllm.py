@@ -1021,7 +1021,7 @@ class VllmConfig:
         executor_supports_async_sched = executor_class.supports_async_scheduling()
         uses_rocm_deepep_ht_dbo = (
             current_platform.is_rocm()
-            and self.parallel_config.use_ubatching
+            and self.parallel_config.use_ubatching  # [theseus ubatch] was enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 
@@ -1528,6 +1528,7 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        # [theseus p2p_nccl] the per-layer count exchange is a host sync
         if (
             self.parallel_config.all2all_backend == "p2p_nccl"
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -1546,7 +1547,7 @@ class VllmConfig:
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "nixl_ep",
-                "p2p_nccl",
+                "p2p_nccl",  # [theseus p2p_nccl]
             ], (
                 "Microbatching currently only supports the deepep_low_latency, "
                 "deepep_high_throughput, nixl_ep, and p2p_nccl all2all backends. "

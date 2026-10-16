@@ -195,12 +195,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import FlashInferNVLinkOneSidedManager
 
                 self.all2all_manager = FlashInferNVLinkOneSidedManager(self.cpu_group)
+            # [theseus prerouted] tokens delivered by an external transport
             elif self.all2all_backend == "prerouted":
                 from .all2all import PreroutedAll2AllManager
 
                 self.all2all_manager = PreroutedAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
+            # [theseus p2p_nccl] point-to-point backend (p2p_nccl_all2all.py)
             elif self.all2all_backend == "p2p_nccl":
                 from .all2all import P2pNcclAll2AllManager
 

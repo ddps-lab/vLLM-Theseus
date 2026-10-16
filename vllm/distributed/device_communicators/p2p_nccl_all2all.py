@@ -29,6 +29,14 @@ Only the GPUs that own at least one selected expert receive a token, so the
 bytes on the wire are ``sum_t |ranks(t)| * row`` instead of the
 ``(world_size - 1) * T * row`` of the all-gather/reduce-scatter backend.
 Expert ids below zero (padding) are not sent anywhere and produce zeros.
+
+Usage (Theseus): ``--all2all-backend p2p_nccl --enable-expert-parallel`` with
+``--data-parallel-size > 1``; the backend needs no DeepEP/NVSHMEM/RDMA and
+runs over plain NCCL (TCP sockets are fine). Micro-batch overlap is
+``--ubatch-size N`` (``--enable-dbo`` for N=2). CUDA graphs are disabled
+automatically (the count exchange is a host sync). ``num_experts`` must be
+divisible by the EP size, EPLB is not supported. ``VLLM_P2P_NCCL_DEBUG=1|2``
+prints per-layer plan/dispatch logs (2 also validates received expert ids).
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger("vllm.distributed.device_communicators.p2p_nccl_all2all")
 
-# DEBUG(p2p_nccl): remove after GPU validation. VLLM_P2P_NCCL_DEBUG=1 logs
+# DEBUG(p2p_nccl): off by default. VLLM_P2P_NCCL_DEBUG=1 logs
 # per-layer counts, bytes and host-wait time (first 8 calls, then every 64th);
 # =2 additionally runs sanity checks that synchronize with the device.
 _DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
@@ -242,7 +250,7 @@ class P2pAll2AllEngine:
             seq=seq,
             host_wait_ms=host_wait_ms,
         )
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(seq):
             logger.info(
                 "p2p_nccl[r%d] plan#%d slot=%d T=%d send=%s recv=%s "
@@ -346,7 +354,7 @@ class P2pAll2AllEngine:
                 group=self.group,
             )
             outputs.append(recv.view(x.dtype) if wire_dtype != x.dtype else recv)
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(plan.seq):
             row_bytes = sum(
                 math.prod(x.shape[1:]) * x.element_size() for x in tensors

@@ -66,7 +66,7 @@ def _post_process_ubatch(tensor: torch.Tensor, num_ubatches: int) -> bool:
     # there are no "empty" second ubatches
     orig_min_num_tokens = int(orig_num_tokens_tensor.min().item())
     padded_max_num_tokens = int(padded_num_tokens_tensor.max().item())
-    # Every ubatch needs at least one token. With fewer padded tokens than
+    # [theseus ubatch] Every ubatch needs at least one token. With fewer padded tokens than
     # ubatches the split point becomes 0 and the leading slices come out empty
     # (reachable when the dbo token thresholds are set below num_ubatches).
     if padded_max_num_tokens < num_ubatches:

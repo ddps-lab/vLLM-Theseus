@@ -1027,6 +1027,7 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             self.handle_cache._cache.clear()
 
 
+# [theseus p2p_nccl] manager for the point-to-point backend
 class P2pNcclAll2AllManager(All2AllManagerBase):
     """
     Selective point-to-point all2all over NCCL send/recv (torch.distributed
@@ -1091,6 +1092,7 @@ class P2pNcclAll2AllManager(All2AllManagerBase):
         self._engine = None
 
 
+# [theseus prerouted] placeholder manager for externally routed EP ranks
 class PreroutedAll2AllManager(All2AllManagerBase):
     """
     Placeholder manager for the "prerouted" backend: the tokens of this EP

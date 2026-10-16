@@ -321,6 +321,7 @@ def maybe_make_prepare_finalize(
             dispatch_scale_bytes_per_token=dispatch_scale_bytes_per_token,
         )
 
+    # [theseus p2p_nccl] build the point-to-point prepare/finalize
     elif moe.use_p2p_nccl_kernels:
         if moe.moe_parallel_config.enable_eplb:
             raise NotImplementedError(
@@ -352,6 +353,7 @@ def maybe_make_prepare_finalize(
             rank=all2all_manager.rank,
         )
 
+    # [theseus prerouted] tokens were delivered by an external transport
     elif moe.use_prerouted_kernels:
         if moe.moe_parallel_config.enable_eplb:
             raise NotImplementedError(
