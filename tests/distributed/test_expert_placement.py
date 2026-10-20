@@ -6,12 +6,8 @@ import torch
 
 from vllm.config import ParallelConfig
 from vllm.distributed.device_communicators.p2p_nccl_all2all import P2pAll2AllEngine
-from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     determine_expert_map,
-)
-from vllm.model_executor.layers.fused_moe.prepare_finalize.prerouted import (
-    PreroutedPrepareAndFinalize,
 )
 
 
@@ -327,24 +323,3 @@ def test_p2p_engine_routes_by_placement_counts():
     assert engine._count_buf(0)[0].tolist() == [2, 2, 0]
     # Destination-major order: rank 0 gets tokens 0 and 2, rank 1 tokens 0, 1.
     assert (pending.order[:4] % 4).tolist() == [0, 2, 0, 1]
-
-
-def test_prerouted_keeps_only_experts_in_expert_map():
-    """Uneven placement: rank 1 owns experts [3, 4) of 4."""
-    prepare_finalize = PreroutedPrepareAndFinalize(
-        num_experts=4, num_local_experts=1, rank=1
-    )
-    expert_map = torch.tensor([-1, -1, -1, 0], dtype=torch.int32)
-    topk_ids = torch.tensor([[3, 0], [2, -1]])
-    topk_weights = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
-    *_, ids, weights = prepare_finalize.prepare(
-        torch.ones(2, 8),
-        topk_weights,
-        topk_ids,
-        4,
-        expert_map,
-        False,
-        FUSED_MOE_UNQUANTIZED_CONFIG,
-    )
-    assert torch.equal(weights, torch.tensor([[0.6, 0.0], [0.0, 0.0]]))
-    assert ids[0, 0] == 3 and (expert_map[ids[~(ids == 3)]] == -1).all()

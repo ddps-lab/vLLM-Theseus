@@ -5,12 +5,14 @@
 Used by expert-parallel ranks whose input tokens were already delivered to
 the rank that owns (some of) their selected experts by an external
 transport, e.g. the AFD FFN role behind a one-hop attention-to-expert
-connector. No communication happens here: slots of experts that live on
-other ranks are rewritten so that ``expert_map`` maps them to ``-1`` and
-their routing weights are zeroed, the local experts kernel runs unchanged,
-and the finalize output is the per-token partial sum over the local experts.
-It is reported as reduced because the external transport sums the partials
-of the different ranks on the token owner.
+connector. No communication happens here: the received global expert ids
+and routing weights go to the local experts kernel unchanged. Slots of
+experts that live on other ranks are skipped by the kernel itself through
+``expert_map`` (which maps them to ``-1``), exactly as in the
+allgather/reduce-scatter path, so no masking pass is needed before the
+kernel. The finalize output is the per-token partial sum over the local
+experts; it is reported as reduced because the external transport sums the
+partials of the different ranks on the token owner.
 
 When the transport delivers activations that were already quantized on the
 sender, the caller stores them in ``prequantized`` before the forward (see
@@ -100,24 +102,7 @@ class PreroutedPrepareAndFinalize(MoEPrepareAndFinalizeNoDPEPModular):
                 quant_config,
                 defer_input_quant,
             )
-        # Slots of experts that live on other ranks: point them at an expert
-        # this rank does not own so that expert_map yields -1, and drop their
-        # routing weight so they contribute nothing to the local partial sum.
-        ids = topk_ids.to(torch.int64)
-        if expert_map is not None:
-            # Follows any placement, including uneven expert_placement_counts.
-            # Padding ids (< 0) must not index the map from its end.
-            is_local = (ids >= 0) & (expert_map[ids.clamp(min=0)] >= 0)
-        else:
-            is_local = (
-                torch.div(ids, self.num_local_experts, rounding_mode="floor")
-                == self.rank
-            )
-        foreign = self.num_experts - 1 if self.rank_expert_offset == 0 else 0
-        expert_topk_ids = torch.where(
-            is_local, topk_ids, torch.full_like(topk_ids, foreign)
-        )
-        expert_topk_weights = torch.where(
-            is_local, topk_weights, torch.zeros_like(topk_weights)
-        )
-        return a1q, a1q_scale, None, expert_topk_ids, expert_topk_weights
+        # The ids are global and the experts kernel skips the slots whose
+        # expert_map entry is -1 (align/sum kernels and the Triton kernel all
+        # do), so the received ids and weights are passed through as they are.
+        return a1q, a1q_scale, None, topk_ids, topk_weights
