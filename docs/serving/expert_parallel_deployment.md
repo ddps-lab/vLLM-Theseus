@@ -55,10 +55,10 @@ Notes:
 Expert-parallel backend for ranks whose tokens were already delivered by an
 external transport, such as the FFN role of the afd-plugin routed
 (one-hop attention-to-expert) connector. No communication happens inside vLLM:
-slots of experts owned by other ranks are masked out, the local experts kernel
-runs unchanged, and the output is the per-token partial sum over the local
-experts; the transport sums the partials of the different ranks on the token
-owner.
+the received global expert ids go to the local experts kernel unchanged, the
+kernel skips the slots whose `expert_map` entry is `-1` (experts owned by other
+ranks), and the output is the per-token partial sum over the local experts; the
+transport sums the partials of the different ranks on the token owner.
 
 Notes:
 
