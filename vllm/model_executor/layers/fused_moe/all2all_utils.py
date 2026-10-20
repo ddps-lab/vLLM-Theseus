@@ -360,12 +360,20 @@ def maybe_make_prepare_finalize(
                 "all2all_backend=prerouted assumes a contiguous expert "
                 "placement and does not support EPLB."
             )
-        if moe.num_experts % moe.moe_parallel_config.ep_size != 0:
+        # Explicit placement counts are followed through expert_map.
+        placement_counts = (
+            get_current_vllm_config().parallel_config.expert_placement_counts
+        )
+        if (
+            placement_counts is None
+            and moe.num_experts % moe.moe_parallel_config.ep_size != 0
+        ):
             raise NotImplementedError(
                 "all2all_backend=prerouted maps expert ids to ranks as "
                 "id // num_local_experts, which needs num_experts "
                 f"({moe.num_experts}) divisible by ep_size "
-                f"({moe.moe_parallel_config.ep_size})."
+                f"({moe.moe_parallel_config.ep_size}) unless "
+                "expert_placement_counts is set."
             )
         if moe.moe_parallel_config.is_sequence_parallel:
             raise NotImplementedError(
