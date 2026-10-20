@@ -163,6 +163,9 @@ class P2pAll2AllEngine:
         self._empty_sends: dict[tuple, torch.Tensor] = {}
         self._zero_send_slots: set[int] = set()
         self._num_plans = 0
+        # mask_rows_past: per (slot, buffer address), how many leading rows
+        # may still hold expert ids from an earlier dispatch.
+        self._dirty_rows: dict[tuple[int, int], int] = {}
 
     # ------------------------------------------------------------------ plan
     def _count_buf(self, slot: int) -> torch.Tensor:
@@ -307,16 +310,38 @@ class P2pAll2AllEngine:
             self._empty_sends[key] = buf
         return buf
 
+    def mask_rows_past(self, slot: int, ids: torch.Tensor, num_valid: int) -> None:
+        """Set the rows ``num_valid:`` of ``ids`` to -1.
+
+        ``ids`` is a fixed-size view (``dispatch(min_rows=...)``) of a receive
+        buffer whose first ``num_valid`` rows the last dispatch on ``slot``
+        wrote. Only the rows that may still hold ids from an earlier dispatch
+        are rewritten (nothing when this dispatch wrote at least as many), and
+        a buffer seen for the first time is filled once. Expert id -1 makes
+        the experts kernel skip the row.
+        """
+        key = (slot, ids.data_ptr())
+        dirty = self._dirty_rows.get(key, ids.shape[0])
+        if dirty > num_valid:
+            ids[num_valid:dirty].fill_(-1)
+        self._dirty_rows[key] = num_valid
+
     # -------------------------------------------------------------- dispatch
     def dispatch(
-        self, plan: P2pAll2AllPlan, tensors: tuple[torch.Tensor, ...]
+        self,
+        plan: P2pAll2AllPlan,
+        tensors: tuple[torch.Tensor, ...],
+        min_rows: int = 0,
     ) -> list[torch.Tensor]:
         """Send row ``t`` of every tensor to each rank token ``t`` visits.
 
-        Returns, for every input ``[T, ...]``, a view ``[num_recv, ...]`` of a
-        preallocated buffer holding the rows received by this rank, grouped
-        by source rank. The views stay valid until the next ``dispatch`` on
-        the same slot.
+        Returns, for every input ``[T, ...]``, a view of a preallocated buffer
+        whose first ``num_recv`` rows hold the rows received by this rank,
+        grouped by source rank. The view has ``max(num_recv, min_rows)`` rows;
+        rows past ``num_recv`` keep whatever the buffer held before (callers
+        that pass ``min_rows`` launch the experts kernel at a fixed size and
+        mask those rows themselves). The views stay valid until the next
+        ``dispatch`` on the same slot.
         """
         outputs: list[torch.Tensor] = []
         stream = _current_stream(self.device)
@@ -345,14 +370,21 @@ class P2pAll2AllEngine:
                 wire_dtype = torch.uint8 if x.dtype in _FP8_DTYPES else x.dtype
                 tail = tuple(x.shape[1:])
                 packed = self._empty_send(tail, wire_dtype)
-            recv = self._buffer(plan.slot, f"recv{i}", plan.num_recv, tail, wire_dtype)
+            recv = self._buffer(
+                plan.slot, f"recv{i}", max(plan.num_recv, min_rows), tail, wire_dtype
+            )
             dist.all_to_all_single(
-                recv,
+                recv[: plan.num_recv],
                 packed,
                 output_split_sizes=plan.recv_counts,
                 input_split_sizes=plan.send_counts,
                 group=self.group,
             )
+            # Keep mask_rows_past's record right when a buffer it tracks is
+            # also used without a fixed size.
+            key = (plan.slot, recv.data_ptr())
+            if key in self._dirty_rows:
+                self._dirty_rows[key] = max(self._dirty_rows[key], plan.num_recv)
             outputs.append(recv.view(x.dtype) if wire_dtype != x.dtype else recv)
         # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(plan.seq):
