@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe import fixed_launch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -255,6 +256,15 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
+        # Rows past valid_rows are padding of a fixed-size launch (see
+        # fixed_launch.py; their expert ids are -1, so the align step drops
+        # them and the GEMMs never touch them). The GEMMs still get the full
+        # shape so that their compile key stays the same; the activation and
+        # the top-k sum stop at valid_rows.
+        valid_rows = fixed_launch.valid_rows(num_tokens)
+        if valid_rows is not None and self._lora_context is not None:
+            valid_rows = None
+        act_rows = num_tokens if valid_rows is None else valid_rows
 
         if global_num_experts == -1:
             global_num_experts = E
@@ -443,9 +453,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quant_dtype=current_platform.fp8_dtype(),
             )
         else:
-            self.activation(
-                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
+            if act_rows > 0:
+                self.activation(
+                    activation,
+                    intermediate_cache2[: act_rows * top_k_num],
+                    intermediate_cache1[:act_rows].view(-1, N),
+                )
 
             qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
                 intermediate_cache2,
@@ -533,7 +546,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 )
 
         # separate function is required for MoE + LoRA
-        self.moe_sum(intermediate_cache3, output)
+        if act_rows > 0:
+            self.moe_sum(intermediate_cache3[:act_rows], output[:act_rows])
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         ops.moe_sum(input, output)
