@@ -114,9 +114,10 @@ class P2pAll2AllEngine:
     """Selective token exchange between the ranks of one expert-parallel group.
 
     Experts are assumed to be assigned contiguously: rank ``r`` owns global
-    experts ``[r * num_local_experts, (r + 1) * num_local_experts)``. Ranks
-    beyond ``num_experts / num_local_experts`` own no experts and only send
-    (e.g. attention ranks of a one-hop AFD deployment); ranks that own
+    experts ``[r * num_local_experts, (r + 1) * num_local_experts)``, or the
+    ``expert_counts[r]`` experts after those of the lower ranks when
+    ``expert_counts`` is given. Ranks beyond those own no experts and only
+    send (e.g. attention ranks of a one-hop AFD deployment); ranks that own
     experts may have no tokens of their own and only receive.
     """
 
@@ -129,6 +130,7 @@ class P2pAll2AllEngine:
         max_tokens_per_rank: int,
         device: torch.device | str,
         combine_group: dist.ProcessGroup | None = None,
+        expert_counts: list[int] | None = None,
     ) -> None:
         if num_local_experts <= 0:
             raise ValueError("num_local_experts must be positive")
@@ -152,6 +154,14 @@ class P2pAll2AllEngine:
         # tokens and grow geometrically on demand (rare after warm-up).
         self.capacity = max_tokens_per_rank
         self._arange_r = torch.arange(world_size, device=self.device)
+        # Owning rank of every global expert for an uneven placement.
+        self._expert_owner = (
+            None
+            if expert_counts is None
+            else torch.repeat_interleave(
+                torch.arange(len(expert_counts)), torch.tensor(expert_counts)
+            ).to(self.device)
+        )
         self._count_bufs: dict[int, torch.Tensor] = {}
         self._buffers: dict[tuple, torch.Tensor] = {}
         # Ranks without tokens of their own (the FFN role of a one-hop AFD
@@ -196,9 +206,12 @@ class P2pAll2AllEngine:
             )
         self._zero_send_slots.discard(slot)
 
-        rank_of = torch.div(
-            topk_ids.to(torch.int64), self.num_local_experts, rounding_mode="floor"
-        )
+        ids = topk_ids.to(torch.int64)
+        if self._expert_owner is None:
+            rank_of = torch.div(ids, self.num_local_experts, rounding_mode="floor")
+        else:
+            # Padding ids (< 0) must not index the table from its end.
+            rank_of = torch.where(ids >= 0, self._expert_owner[ids.clamp(min=0)], -1)
         # dest[t, r]: token t has to visit rank r (at most once per rank).
         # Negative ids (padding) match no rank.
         dest = (rank_of.unsqueeze(-1) == self._arange_r).any(dim=1)

@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
+from vllm.config import ParallelConfig
+from vllm.distributed.device_communicators.p2p_nccl_all2all import P2pAll2AllEngine
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     determine_expert_map,
 )
@@ -244,3 +247,79 @@ def test_determine_expert_map_comprehensive():
                 f"expert_placement_strategy={expert_placement_strategy}: "
                 f"expected map {expected_map_pattern}, got {actual_map}"
             )
+
+
+@pytest.mark.parametrize("counts", [[48, 16], [16, 48], [3, 1, 4]])
+def test_placement_counts_give_contiguous_blocks(counts):
+    """Rank r owns the counts[r] experts that follow the lower ranks'."""
+    start = 0
+    for ep_rank, count in enumerate(counts):
+        local_num_experts, expert_map, _ = determine_expert_map(
+            len(counts), ep_rank, sum(counts), expert_placement_counts=counts
+        )
+        assert local_num_experts == count
+        expected = [-1] * sum(counts)
+        expected[start : start + count] = range(count)
+        assert expert_map.tolist() == expected
+        start += count
+
+
+@pytest.mark.parametrize(("global_num_experts", "ep_size"), [(64, 2), (9, 2), (8, 3)])
+def test_even_placement_counts_match_default(global_num_experts, ep_size):
+    """Counts of the default split reproduce it, remainder on the first ranks."""
+    for ep_rank in range(ep_size):
+        default = determine_expert_map(ep_size, ep_rank, global_num_experts)
+        counts = [
+            determine_expert_map(ep_size, r, global_num_experts)[0]
+            for r in range(ep_size)
+        ]
+        explicit = determine_expert_map(
+            ep_size, ep_rank, global_num_experts, expert_placement_counts=counts
+        )
+        assert explicit[0] == default[0]
+        assert torch.equal(explicit[1], default[1])
+
+
+@pytest.mark.parametrize(
+    ("counts", "strategy"),
+    [([48, 15], "linear"), ([32, 16, 16], "linear"), ([48, 16], "round_robin")],
+)
+def test_invalid_placement_counts_raise(counts, strategy):
+    with pytest.raises(ValueError):
+        determine_expert_map(2, 0, 64, strategy, expert_placement_counts=counts)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"expert_placement_counts": [48, 0]},
+        {
+            "expert_placement_counts": [48, 16],
+            "expert_placement_strategy": "round_robin",
+        },
+        {"expert_placement_counts": [48, 16], "all2all_backend": "p2p_nccl"},
+        {"expert_placement_counts": [48, 16], "enable_ep_weight_filter": True},
+    ],
+)
+def test_placement_counts_config_rejects_unsupported(overrides):
+    with pytest.raises(ValueError):
+        ParallelConfig(**overrides)
+
+
+def test_p2p_engine_routes_by_placement_counts():
+    """Tokens visit the ranks that own their experts; padding visits none."""
+    # Two expert ranks owning experts [0, 3) and [3, 4), one rank without.
+    engine = P2pAll2AllEngine(
+        group=None,
+        rank=2,
+        world_size=3,
+        num_local_experts=2,
+        max_tokens_per_rank=4,
+        device="cpu",
+        expert_counts=[3, 1],
+    )
+    topk_ids = torch.tensor([[0, 3], [3, -1], [1, 2], [-1, -1]])
+    pending = engine.begin_plan(topk_ids)
+    assert engine._count_buf(0)[0].tolist() == [2, 2, 0]
+    # Destination-major order: rank 0 gets tokens 0 and 2, rank 1 tokens 0, 1.
+    assert (pending.order[:4] % 4).tolist() == [0, 2, 0, 1]
