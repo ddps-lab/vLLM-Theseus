@@ -19,6 +19,19 @@ static input scale, block shape or per-token quantization): it depends on
 the sender's batch, so those activations travel unquantized and are
 quantized after the dispatch, as the DeepEP backend does.
 
+Fixed-size launch: the number of received rows differs per rank and per
+layer, and the Triton experts kernel is compiled again for every new shape
+it meets, so each rank would stop at a different time to compile while the
+others wait in the combine. The experts kernel therefore always gets the
+whole receive buffer (the most rows this rank can receive in one step:
+world size x max tokens per rank). Rows past the received ones get expert
+id -1, which the align step drops, and the experts kernel is told how many
+rows are real (``fixed_launch.py``) so that its non-JIT steps (activation,
+sum over top-k) stop there; the finalize returns only the real rows. The
+Triton kernels then see one shape and are compiled once, at start-up.
+Quantized activations, and a step that receives more rows than the fixed
+size, are launched at the received size as before.
+
 Dual batch overlap: ``prepare_async``/``finalize_async`` follow the DeepEP
 normal-mode pattern. The thread yields to the other micro-batch *before*
 posting the count exchange and blocking on the host copy of the counts, so
@@ -41,6 +54,7 @@ from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllPlan,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import fixed_launch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -182,6 +196,32 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # One in-flight plan per micro-batch slot.
         self._plans: dict[int, P2pAll2AllPlan] = {}
         self._num_prepares = 0  # DEBUG(p2p_nccl)
+        # Fixed-size launch (see the module docstring): rows handed to the
+        # experts kernel.
+        self._fixed_rows = engine.world_size * engine.max_tokens_per_rank
+        # Set by post_init_setup: only the unquantized Triton experts kernel
+        # reads the real-row count (other kernels would compute the padding,
+        # and a dynamic activation scale would cover it).
+        self._fixed_experts: mk.FusedMoEExperts | None = None
+        self._fixed_overflow_logged = False
+        # One prepare/finalize per MoE layer: log once per process.
+        logger.info_once(
+            "p2p_nccl P/F rank=%d: fixed-size experts launch, %d rows",
+            rank, self._fixed_rows,
+        )
+
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
+        if (
+            type(fused_experts).__name__ == "TritonExperts"
+            and fused_experts.quant_config.quant_dtype is None
+        ):
+            self._fixed_experts = fused_experts
+
+    def _fixed_launch_ok(self) -> bool:
+        experts = self._fixed_experts
+        return (
+            experts is not None and getattr(experts, "_lora_context", None) is None
+        )
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -261,7 +301,24 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         dbo_yield_and_switch_from_compute_to_comm()
         self.engine.exchange_counts(pending)
         plan = self.engine.finish_plan(pending)
-        received = self.engine.dispatch(plan, tuple(tensors))
+        fixed = (
+            self._fixed_launch_ok()
+            and quant_config.quant_dtype is None
+            and plan.num_recv <= self._fixed_rows
+        )
+        if plan.num_recv > self._fixed_rows:
+            if not self._fixed_overflow_logged:
+                logger.warning(
+                    "p2p_nccl P/F rank=%d: received %d rows > fixed launch size "
+                    "%d; launching at the received size",
+                    self.rank, plan.num_recv, self._fixed_rows,
+                )
+                self._fixed_overflow_logged = True
+        received = self.engine.dispatch(
+            plan, tuple(tensors), min_rows=self._fixed_rows if fixed else 0
+        )
+        if not fixed:
+            received = [r[: plan.num_recv] for r in received]
         recv_a1, recv_ids, recv_weights = received[0], received[1], received[2]
         recv_scale = received[3] if scale_to_send is not None else None
         self._plans[slot] = plan
@@ -272,16 +329,25 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             # expert_map entry is -1 (align/sum kernels and the Triton kernel
             # all do), so the received ids and weights pass through as they
             # are, as in the allgather/reduce-scatter path.
+            num_recv = plan.num_recv
+            if fixed:
+                # Fixed-size launch: the rows past num_recv get expert id -1
+                # and the experts kernel learns how many rows are real.
+                self.engine.mask_rows_past(plan.slot, recv_ids, num_recv)
+                fixed_launch.set_valid_rows(num_recv, recv_ids.shape[0])
+            else:
+                fixed_launch.clear_valid_rows()
             # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG=2; these checks
             # synchronize with the device.
-            if _DEBUG >= 2 and recv_ids.numel() > 0:
-                lo, hi = int(recv_ids.min()), int(recv_ids.max())
+            if _DEBUG >= 2 and num_recv > 0:
+                real_ids = recv_ids[:num_recv]
+                lo, hi = int(real_ids.min()), int(real_ids.max())
                 assert lo >= 0 and hi < self.num_experts, (
                     f"p2p_nccl: received expert ids out of range [{lo}, {hi}]"
                 )
                 is_local = (
                     torch.div(
-                        recv_ids.to(torch.int64),
+                        real_ids.to(torch.int64),
                         self.num_local_experts,
                         rounding_mode="floor",
                     )
@@ -352,6 +418,13 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
 
+        # The real-row count was for this layer's experts call only.
+        fixed_launch.clear_valid_rows()
+        if fused_expert_output.shape[0] > plan.num_recv:
+            # Fixed-size launch: only the first num_recv rows are real.
+            fused_expert_output = fused_expert_output[: plan.num_recv]
+            topk_weights = topk_weights[: plan.num_recv]
+            topk_ids = topk_ids[: plan.num_recv]
         if fused_expert_output.numel() != 0:
             partial = weight_and_reduce_impl.apply(
                 output=None,

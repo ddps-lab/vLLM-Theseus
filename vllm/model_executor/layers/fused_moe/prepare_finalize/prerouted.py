@@ -19,6 +19,11 @@ sender, the caller stores them in ``prequantized`` before the forward (see
 ``set_prequantized``) and passes a placeholder of the unquantized dtype as
 the kernel input; the placeholder only determines the output dtype and the
 token count.
+
+Fixed-size launch (see ``fixed_launch.py``): the one-hop AFD connector may
+hand over its whole receive buffer, with expert id -1 on the rows past the
+received ones; the experts kernel then sees one shape. The finalize copies
+only the real rows into the output.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from __future__ import annotations
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe import fixed_launch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
@@ -106,3 +112,30 @@ class PreroutedPrepareAndFinalize(MoEPrepareAndFinalizeNoDPEPModular):
         # expert_map entry is -1 (align/sum kernels and the Triton kernel all
         # do), so the received ids and weights are passed through as they are.
         return a1q, a1q_scale, None, topk_ids, topk_weights
+
+    def finalize(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> None:
+        # Fixed-size launch: the rows past the real ones are padding that the
+        # caller drops, so only the real rows go into the output.
+        valid = fixed_launch.valid_rows(output.shape[0])
+        fixed_launch.clear_valid_rows()  # it was for this layer only
+        if valid is not None:
+            output = output[:valid]
+            fused_expert_output = fused_expert_output[:valid]
+            topk_weights = topk_weights[:valid]
+            topk_ids = topk_ids[:valid]
+        super().finalize(
+            output,
+            fused_expert_output,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            weight_and_reduce_impl,
+        )
