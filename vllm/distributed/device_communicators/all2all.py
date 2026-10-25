@@ -1122,6 +1122,11 @@ class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
                 num_local_experts=num_local_experts,
                 max_tokens_per_rank=max_tokens_per_rank,
                 device=ep_group.device,
+                # The regions are registered before the metadata exchange,
+                # so the shapes are needed now (see p2p_nixl_all2all.py).
+                hidden_dim=kwargs["hidden_dim"],
+                top_k=kwargs["top_k"],
+                act_dtype=kwargs["act_dtype"],
             )
             logger.info_once(
                 "p2p_nixl all2all: world_size=%d, %d local experts, "

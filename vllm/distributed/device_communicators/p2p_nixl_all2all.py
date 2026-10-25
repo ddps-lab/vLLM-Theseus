@@ -22,6 +22,13 @@ token visits a rank at most once, so a share never exceeds ``R`` rows.
 into the receive buffer the caller expects, so the prepare / finalize code
 and the fixed-size launch are unchanged.
 
+The regions are registered at construction, before the agent metadata is
+exchanged: NIXL's agent metadata carries the registered memory, and a peer
+can only WRITE into memory it learnt about that way (registering later would
+leave the peers with no backend able to reach the region). The tensor shapes
+are therefore given to the constructor (hidden size, top-k, dtypes) and an
+unexpected shape at dispatch is an error.
+
 A region is safe to rewrite once the next layer's count exchange (NCCL,
 every rank takes part) has happened: by then the previous rows were
 consumed. The notification carries the plan sequence number, which advances
@@ -60,7 +67,16 @@ def _agent_name(rank: int) -> str:
 class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     """``P2pAll2AllEngine`` whose dispatch/combine rows travel as NIXL WRITEs."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        hidden_dim: int,
+        top_k: int,
+        act_dtype: torch.dtype,
+        ids_dtype: torch.dtype = torch.int32,
+        weights_dtype: torch.dtype = torch.float32,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         from nixl import nixl_agent, nixl_agent_config  # noqa: PLC0415
 
@@ -84,16 +100,47 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         self._peer_agents: dict[int, str] = {}
         self._writes: list[Any] = []
         self._notifs: dict[str, list[bytes]] = {}
+        # dispatch: hidden, ids, weights (the prepare sends them in this
+        # order, unquantized); combine: the partial sums, hidden-sized.
+        for key in (
+            ("recv0", (hidden_dim,), act_dtype),
+            ("recv1", (top_k,), ids_dtype),
+            ("recv2", (top_k,), weights_dtype),
+            ("back", (hidden_dim,), act_dtype),
+        ):
+            self._alloc(key)
         self._register_agents()
 
     # ---------------------------------------------------------------- setup
+    def _alloc(self, key: tuple) -> None:
+        """Allocate and register the receive region and the send buffer of
+        ``key`` (``(kind, tail, dtype)``), plus the gather buffer."""
+        _, tail, dtype = key
+        rows = self.world_size * self.max_tokens_per_rank
+        region = torch.empty((rows, *tail), dtype=dtype, device=self.device)
+        send = torch.empty_like(region)
+        self.agent.register_memory([region, send])
+        self._regions[key] = region
+        self._sends[key] = send
+        self._gathers[key] = torch.empty_like(region)
+
     def _register_agents(self) -> None:
-        """Exchange agent metadata (collective on the NCCL group)."""
-        mine = (self.agent.get_agent_metadata(), self.device.index)
+        """Exchange agent metadata (which carries the registered regions) and
+        the region addresses; collective on the NCCL group."""
+        mine = (
+            self.agent.get_agent_metadata(),
+            self.device.index,
+            {
+                key: (region.data_ptr(), region[0].numel() * region.element_size())
+                for key, region in self._regions.items()
+            },
+        )
         everyone: list[Any] = [None] * self.world_size
         dist.all_gather_object(everyone, mine, group=self.group)
         self._peer_devices = [info[1] for info in everyone]
-        for peer, (metadata, _) in enumerate(everyone):
+        for key in self._regions:
+            self._peer_regions[key] = [info[2][key] for info in everyone]
+        for peer, (metadata, _, _) in enumerate(everyone):
             if peer == self.rank:
                 continue
             # add_remote_agent returns the name as bytes while notifications
@@ -102,26 +149,15 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             self._peer_agents[peer] = _agent_name(peer)
 
     def _region(self, kind: str, tail: tuple[int, ...], dtype: torch.dtype) -> tuple:
-        """Register (once, collectively) the region for one tensor shape.
-
-        Every rank meets the same tensor shapes in the same order (same
-        model, same layer), so this collective is matched across ranks.
-        """
+        """Key of the registered region for one tensor shape (registered at
+        construction; an unexpected shape cannot be added later, see the
+        module docstring)."""
         key = (kind, tuple(tail), dtype)
-        if key in self._regions:
-            return key
-        rows = self.world_size * self.max_tokens_per_rank
-        region = torch.empty((rows, *tail), dtype=dtype, device=self.device)
-        send = torch.empty_like(region)
-        self.agent.register_memory([region, send])
-        self._regions[key] = region
-        self._sends[key] = send
-        self._gathers[key] = torch.empty_like(region)
-        row_bytes = region[0].numel() * region.element_size()
-        mine = (region.data_ptr(), row_bytes)
-        everyone: list[Any] = [None] * self.world_size
-        dist.all_gather_object(everyone, mine, group=self.group)
-        self._peer_regions[key] = everyone
+        if key not in self._regions:
+            raise RuntimeError(
+                f"p2p_nixl: no registered region for {key}; registered: "
+                f"{sorted(self._regions)}"
+            )
         return key
 
     # ------------------------------------------------------------- transfer
