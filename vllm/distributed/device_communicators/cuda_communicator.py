@@ -209,6 +209,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = P2pNcclAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
+            # [theseus p2p_nixl] rows over NIXL WRITEs (p2p_nixl_all2all.py)
+            elif self.all2all_backend == "p2p_nixl":
+                from .all2all import P2pNixlAll2AllManager
+
+                self.all2all_manager = P2pNixlAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 
