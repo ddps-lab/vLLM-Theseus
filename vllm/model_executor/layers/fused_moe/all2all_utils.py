@@ -345,6 +345,10 @@ def maybe_make_prepare_finalize(
             dict(
                 num_local_experts=moe.num_local_experts,
                 max_tokens_per_rank=moe.max_num_tokens,
+                # [theseus p2p_nixl] region shapes (ignored by p2p_nccl)
+                hidden_dim=moe.hidden_dim,
+                top_k=moe.experts_per_token,
+                act_dtype=moe.in_dtype,
             )
         )
         prepare_finalize = P2pNcclPrepareAndFinalize(
