@@ -48,6 +48,7 @@ All2AllBackend = Literal[
     "nixl_ep",
     "allgather_reducescatter",
     "p2p_nccl",  # [theseus p2p_nccl]
+    "p2p_nixl",  # [theseus p2p_nixl]
     "prerouted",  # [theseus prerouted]
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
@@ -196,6 +197,9 @@ class ParallelConfig:
     - "allgather_reducescatter": All2all based on allgather and reducescatter
     - "p2p_nccl": Point-to-point NCCL send/recv to the ranks that own the
       selected experts only (works over TCP, eager mode only)
+    - "p2p_nixl": Same as p2p_nccl but the rows travel as one-sided NIXL
+      WRITEs (UCX; works over TCP); the count exchange stays NCCL. Eager
+      mode, one micro-batch, unquantized rows only
     - "prerouted": No all2all. The tokens were already delivered to the rank
       that owns their experts by an external transport (AFD FFN role)
     - "deepep_high_throughput": Use deepep high-throughput kernels

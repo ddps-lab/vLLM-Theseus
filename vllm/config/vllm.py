@@ -1529,15 +1529,17 @@ class VllmConfig:
             )
 
         # [theseus p2p_nccl] the per-layer count exchange is a host sync
+        # ([theseus p2p_nixl] same count exchange)
         if (
-            self.parallel_config.all2all_backend == "p2p_nccl"
+            self.parallel_config.all2all_backend in ("p2p_nccl", "p2p_nixl")
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             logger.warning(
-                "all2all_backend=p2p_nccl exchanges per-destination token counts "
+                "all2all_backend=%s exchanges per-destination token counts "
                 "with the host in every MoE layer, which cannot be captured in a "
                 "CUDA graph. Disabling CUDA graphs (equivalent to "
-                "-cc.cudagraph_mode=none)."
+                "-cc.cudagraph_mode=none).",
+                self.parallel_config.all2all_backend,
             )
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
