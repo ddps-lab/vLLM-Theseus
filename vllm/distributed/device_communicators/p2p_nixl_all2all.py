@@ -13,12 +13,14 @@ runs no kernel while the rows are in flight; the wait is a host-side poll.
 
 Layout: every rank registers, per received tensor (hidden, ids, weights,
 ...), one region of ``world_size * R`` rows (``R = max_tokens_per_rank``) for
-dispatch and one for the partial sums coming back (combine). Rank ``s``
-writes its share for rank ``d`` into rows ``[s*R, (s+1)*R)`` of ``d``'s
-regions; a token visits a rank at most once, so a share never exceeds
-``R`` rows. ``dispatch`` then gathers the shares (source-major, like the
-NCCL engine) into the receive buffer the caller expects, so the prepare /
-finalize code and the fixed-size launch are unchanged.
+dispatch and one for the partial sums coming back (combine), plus a send
+buffer of the same size (NIXL moves data only between registered memory,
+so the packed rows are staged there before the WRITE). Rank ``s`` writes
+its share for rank ``d`` into rows ``[s*R, (s+1)*R)`` of ``d``'s regions; a
+token visits a rank at most once, so a share never exceeds ``R`` rows.
+``dispatch`` then gathers the shares (source-major, like the NCCL engine)
+into the receive buffer the caller expects, so the prepare / finalize code
+and the fixed-size launch are unchanged.
 
 A region is safe to rewrite once the next layer's count exchange (NCCL,
 every rank takes part) has happened: by then the previous rows were
@@ -72,6 +74,9 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # launch wants one contiguous buffer; the region's shares are R apart).
         self._regions: dict[tuple, torch.Tensor] = {}
         self._gathers: dict[tuple, torch.Tensor] = {}
+        # Registered send buffers (same size): the WRITE source must be
+        # registered memory as well.
+        self._sends: dict[tuple, torch.Tensor] = {}
         # Per region key: rank -> (base address, row bytes) of the peers'
         # regions and the peers' device ids, exchanged over the NCCL group.
         self._peer_regions: dict[tuple, list[tuple[int, int]]] = {}
@@ -107,8 +112,10 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             return key
         rows = self.world_size * self.max_tokens_per_rank
         region = torch.empty((rows, *tail), dtype=dtype, device=self.device)
-        self.agent.register_memory([region])
+        send = torch.empty_like(region)
+        self.agent.register_memory([region, send])
         self._regions[key] = region
+        self._sends[key] = send
         self._gathers[key] = torch.empty_like(region)
         row_bytes = region[0].numel() * region.element_size()
         mine = (region.data_ptr(), row_bytes)
@@ -167,7 +174,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
 
     def _exchange(
         self,
-        kind: str,
+        key: tuple,
         plan: P2pAll2AllPlan,
         packed: torch.Tensor,
         send_counts: list[int],
@@ -175,11 +182,10 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         out_rows: int,
         notif: bytes,
     ) -> torch.Tensor:
-        """Move ``packed`` (destination-major, ``send_counts``) to its owners and
-        return this rank's received rows gathered source-major
-        (``recv_counts``) in a buffer of ``out_rows`` rows."""
-        tail = tuple(packed.shape[1:])
-        key = self._region(kind, tail, packed.dtype)
+        """Move ``packed`` (destination-major, ``send_counts``, a view of the
+        registered send buffer of ``key``) to its owners and return this
+        rank's received rows gathered source-major (``recv_counts``) in a
+        buffer of ``out_rows`` rows."""
         region, gather = self._regions[key], self._gathers[key]
         R = self.max_tokens_per_rank
         # The sends read ``packed`` on the current stream: finish it first.
@@ -230,12 +236,12 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                 )
             if x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                 raise RuntimeError("p2p_nixl carries unquantized rows only")
-            tail = tuple(x.shape[1:])
-            packed = self._buffer(plan.slot, f"send{i}", num_send, tail, x.dtype)
+            key = self._region(f"recv{i}", tuple(x.shape[1:]), x.dtype)
+            packed = self._sends[key][:num_send]
             if num_send > 0:
                 torch.index_select(x, 0, plan.perm, out=packed)
             recv = self._exchange(
-                f"recv{i}",
+                key,
                 plan,
                 packed,
                 plan.send_counts,
@@ -256,13 +262,16 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             raise ValueError(
                 f"partial has {partial.shape[0]} rows, plan expects {plan.num_recv}"
             )
-        partial = partial.contiguous()
-        # Going back: this rank sends recv_counts (source-major rows it holds)
-        # and receives send_counts (its own tokens' partials, perm order).
+        # Stage into the registered send buffer. Going back: this rank sends
+        # recv_counts (source-major rows it holds) and receives send_counts
+        # (its own tokens' partials, perm order).
+        key = self._region("back", tuple(partial.shape[1:]), partial.dtype)
+        staged = self._sends[key][: plan.num_recv]
+        staged.copy_(partial)
         return self._exchange(
-            "back",
+            key,
             plan,
-            partial,
+            staged,
             plan.recv_counts,
             plan.send_counts,
             plan.num_send,
