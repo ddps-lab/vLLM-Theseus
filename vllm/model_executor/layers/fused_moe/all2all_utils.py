@@ -322,27 +322,33 @@ def maybe_make_prepare_finalize(
         )
 
     # [theseus p2p_nccl] build the point-to-point prepare/finalize
+    # ([theseus p2p_nixl] shares it; only the engine differs)
     elif moe.use_p2p_nccl_kernels:
+        backend = moe.moe_parallel_config.all2all_backend
         if moe.moe_parallel_config.enable_eplb:
             raise NotImplementedError(
-                "all2all_backend=p2p_nccl assumes a contiguous expert "
+                f"all2all_backend={backend} assumes a contiguous expert "
                 "placement and does not support EPLB yet."
             )
         if moe.num_experts % moe.moe_parallel_config.ep_size != 0:
             raise NotImplementedError(
-                "all2all_backend=p2p_nccl maps expert ids to ranks as "
+                f"all2all_backend={backend} maps expert ids to ranks as "
                 "id // num_local_experts, which needs num_experts "
                 f"({moe.num_experts}) divisible by ep_size "
                 f"({moe.moe_parallel_config.ep_size})."
             )
         if moe.moe_parallel_config.is_sequence_parallel:
             raise NotImplementedError(
-                "all2all_backend=p2p_nccl does not support sequence-parallel MoE."
+                f"all2all_backend={backend} does not support sequence-parallel MoE."
             )
         handle = all2all_manager.get_handle(
             dict(
                 num_local_experts=moe.num_local_experts,
                 max_tokens_per_rank=moe.max_num_tokens,
+                # [theseus p2p_nixl] region shapes (ignored by p2p_nccl)
+                hidden_dim=moe.hidden_dim,
+                top_k=moe.experts_per_token,
+                act_dtype=moe.in_dtype,
             )
         )
         prepare_finalize = P2pNcclPrepareAndFinalize(

@@ -21,6 +21,7 @@ from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
 
 from .base_device_communicator import All2AllManagerBase, Cache
 from .p2p_nccl_all2all import P2pAll2AllEngine
+from .p2p_nixl_all2all import P2pNixlAll2AllEngine  # [theseus p2p_nixl]
 
 if has_flashinfer_nvlink_two_sided():
     from flashinfer.comm import Mapping  # type: ignore[import-not-found]
@@ -1093,6 +1094,52 @@ class P2pNcclAll2AllManager(All2AllManagerBase):
 
 
 # [theseus prerouted] placeholder manager for externally routed EP ranks
+
+
+# [theseus p2p_nixl] same backend with the rows carried by NIXL WRITEs
+class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
+    """``P2pNcclAll2AllManager`` whose engine moves the rows with one-sided
+    NIXL WRITEs (``p2p_nixl_all2all.py``); the count exchange stays NCCL.
+    Unquantized rows and no dual batch overlap (refused in get_handle)."""
+
+    def get_handle(self, kwargs):
+        if self._engine is None:
+            from vllm.config import get_current_vllm_config
+
+            cfg = get_current_vllm_config()
+            if cfg.parallel_config.use_ubatching:
+                raise RuntimeError(
+                    "all2all_backend=p2p_nixl supports one micro-batch only: "
+                    "disable --enable-dbo and --ubatch-size"
+                )
+            num_local_experts = kwargs["num_local_experts"]
+            max_tokens_per_rank = kwargs["max_tokens_per_rank"]
+            ep_group = get_ep_group()
+            self._engine = P2pNixlAll2AllEngine(
+                group=ep_group.device_group,
+                rank=self.rank,
+                world_size=self.world_size,
+                num_local_experts=num_local_experts,
+                max_tokens_per_rank=max_tokens_per_rank,
+                device=ep_group.device,
+                # The regions are registered before the metadata exchange,
+                # so the shapes are needed now (see p2p_nixl_all2all.py).
+                hidden_dim=kwargs["hidden_dim"],
+                top_k=kwargs["top_k"],
+                act_dtype=kwargs["act_dtype"],
+            )
+            logger.info_once(
+                "p2p_nixl all2all: world_size=%d, %d local experts, "
+                "buffer capacity %d rows per tensor, regions %d rows, backend UCX.",
+                self.world_size,
+                num_local_experts,
+                self._engine.capacity,
+                self.world_size * max_tokens_per_rank,
+            )
+            return self._engine
+        return super().get_handle(kwargs)
+
+
 class PreroutedAll2AllManager(All2AllManagerBase):
     """
     Placeholder manager for the "prerouted" backend: the tokens of this EP

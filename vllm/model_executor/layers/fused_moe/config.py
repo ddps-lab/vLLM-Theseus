@@ -1097,7 +1097,10 @@ class FusedMoEParallelConfig:
     # [theseus p2p_nccl]
     @property
     def use_p2p_nccl_kernels(self):
-        return self.use_all2all_kernels and self.all2all_backend == "p2p_nccl"
+        return self.use_all2all_kernels and self.all2all_backend in (
+            "p2p_nccl",
+            "p2p_nixl",  # [theseus p2p_nixl] same prepare/finalize
+        )
 
     # [theseus prerouted]
     @property
