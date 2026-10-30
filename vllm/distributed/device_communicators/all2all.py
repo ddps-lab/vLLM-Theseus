@@ -1100,18 +1100,14 @@ class P2pNcclAll2AllManager(All2AllManagerBase):
 class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
     """``P2pNcclAll2AllManager`` whose engine moves the rows with one-sided
     NIXL WRITEs (``p2p_nixl_all2all.py``); the count exchange stays NCCL.
-    Unquantized rows and no dual batch overlap (refused in get_handle)."""
+    Unquantized rows only; one set of regions per micro-batch."""
 
     def get_handle(self, kwargs):
         if self._engine is None:
             from vllm.config import get_current_vllm_config
 
             cfg = get_current_vllm_config()
-            if cfg.parallel_config.use_ubatching:
-                raise RuntimeError(
-                    "all2all_backend=p2p_nixl supports one micro-batch only: "
-                    "disable --enable-dbo and --ubatch-size"
-                )
+            num_slots = max(1, cfg.parallel_config.num_ubatches)
             num_local_experts = kwargs["num_local_experts"]
             max_tokens_per_rank = kwargs["max_tokens_per_rank"]
             ep_group = get_ep_group()
@@ -1127,14 +1123,17 @@ class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
                 hidden_dim=kwargs["hidden_dim"],
                 top_k=kwargs["top_k"],
                 act_dtype=kwargs["act_dtype"],
+                num_slots=num_slots,
             )
             logger.info_once(
                 "p2p_nixl all2all: world_size=%d, %d local experts, "
-                "buffer capacity %d rows per tensor, regions %d rows, backend UCX.",
+                "buffer capacity %d rows per tensor, regions %d rows x %d "
+                "micro-batch slots, backend UCX.",
                 self.world_size,
                 num_local_experts,
                 self._engine.capacity,
                 self.world_size * max_tokens_per_rank,
+                num_slots,
             )
             return self._engine
         return super().get_handle(kwargs)

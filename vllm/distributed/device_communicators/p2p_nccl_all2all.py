@@ -119,7 +119,19 @@ class P2pAll2AllEngine:
     ``expert_counts`` is given. Ranks beyond those own no experts and only
     send (e.g. attention ranks of a one-hop AFD deployment); ranks that own
     experts may have no tokens of their own and only receive.
+
+    ``deferred_receive`` is False here: the NCCL receives are ordered on the
+    stream, so the rows ``dispatch`` and ``combine_send`` return are valid
+    once the stream reaches them. An engine that sets it True (the NIXL one)
+    needs ``dispatch_wait`` before the rows are read, and waits itself in
+    ``combine_accumulate``.
     """
+
+    deferred_receive = False
+
+    def dispatch_wait(self, plan: P2pAll2AllPlan) -> None:
+        """Nothing to wait for: the stream orders the NCCL receives."""
+        return None
 
     def __init__(
         self,
