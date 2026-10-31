@@ -223,6 +223,11 @@ class TorchProfilerWrapper(WorkerProfiler):
             with_stack=profiler_config.torch_profiler_with_stack,
             with_flops=profiler_config.torch_profiler_with_flops,
             on_trace_ready=trace_handler,
+            experimental_config=(
+                torch.profiler._ExperimentalConfig(profile_all_threads=True)
+                if profiler_config.torch_profiler_all_threads
+                else None
+            ),
         )
 
         # Track if we're using a schedule (need to call step())
