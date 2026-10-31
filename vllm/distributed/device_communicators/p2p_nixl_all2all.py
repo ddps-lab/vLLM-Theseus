@@ -221,7 +221,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # The host copy of the counts would block in the stream sync; poll
         # for the exchange instead so the posted WRITEs are serviced (their
         # notifications only go out when their state is checked) meanwhile.
-        self._wait_until(self._stream_done(), "count exchange")
+        with torch.profiler.record_function("p2p_nixl.count_wait"):
+            self._wait_until(self._stream_done(), "count exchange")
         return super().finish_plan(pending)
 
     def _write(
@@ -409,7 +410,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             outputs.append(recv)
         # One WRITE per peer carrying hidden, ids and weights, so one
         # notification per peer announces the whole share.
-        self._post(slot, packed, plan.send_counts, notif)
+        with torch.profiler.record_function(f"p2p_nixl.dispatch_post[{slot}]"):
+            self._post(slot, packed, plan.send_counts, notif)
         self._pending[(slot, "d")] = _PendingReceive(
             notif=notif, recv_counts=plan.recv_counts, keys=keys, out_rows=out_rows
         )
@@ -418,7 +420,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     def dispatch_wait(self, plan: P2pAll2AllPlan) -> None:
         """Wait for the rows of ``plan``'s dispatch; the views ``dispatch``
         returned hold them afterwards (gathered on the current stream)."""
-        self._receive(plan.slot, "d")
+        with torch.profiler.record_function(f"p2p_nixl.dispatch_wait[{plan.slot}]"):
+            self._receive(plan.slot, "d")
 
     def combine_send(self, plan: P2pAll2AllPlan, partial: torch.Tensor) -> torch.Tensor:
         """Return ``partial`` (``[num_recv, ...]``) to the owners as NIXL WRITEs;
@@ -438,7 +441,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         staged = self._sends[key][self._slot_rows(slot)][: plan.num_recv]
         staged.copy_(partial)
         notif = f"c{plan.seq}".encode()
-        self._post(slot, [(key, staged)], plan.recv_counts, notif)
+        with torch.profiler.record_function(f"p2p_nixl.combine_post[{slot}]"):
+            self._post(slot, [(key, staged)], plan.recv_counts, notif)
         self._pending[(slot, "c")] = _PendingReceive(
             notif=notif,
             recv_counts=plan.send_counts,
@@ -452,7 +456,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     ) -> torch.Tensor:
         """Wait for the partial sums of ``plan``'s combine, then sum them into
         ``out`` as the NCCL engine does."""
-        self._receive(plan.slot, "c")
+        with torch.profiler.record_function(f"p2p_nixl.combine_wait[{plan.slot}]"):
+            self._receive(plan.slot, "c")
         return super().combine_accumulate(plan, back, out)
 
 
