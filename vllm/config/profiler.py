@@ -66,6 +66,12 @@ class ProfilerConfig:
     """If `True`, enables memory profiling in the torch profiler.
     Disabled by default."""
 
+    torch_profiler_all_threads: bool = False
+    """If `True`, records the ops of every thread, not only of the thread that
+    starts the profiler. Dual batch overlap runs each micro-batch on its own
+    thread, so its ops are missing from the trace without this. Disabled by
+    default."""
+
     capture_torch_profiler: bool = False
     """If `True`, enables a torch profiler during CUDA graph capture on rank 0.
     Traces are saved to a `capture_traces` subdirectory under `torch_profiler_dir`.
