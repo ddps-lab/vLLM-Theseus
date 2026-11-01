@@ -16,7 +16,8 @@ Layout: every rank registers, per received tensor (hidden, ids, weights,
 max_tokens_per_rank``, one slot per micro-batch) for dispatch and one for
 the partial sums coming back (combine), plus a send buffer of the same size
 (NIXL moves data only between registered memory, so the packed rows are
-staged there before the WRITE). Rank ``s`` writes its share of slot ``u``
+staged there before the WRITE). Both are pinned host memory (host staging,
+below). Rank ``s`` writes its share of slot ``u``
 for rank ``d`` into rows ``[(u * world_size + s) * R, +R)`` of ``d``'s
 regions; a token visits a rank at most once, so a share never exceeds ``R``
 rows. The receive is then gathered (source-major, like the NCCL engine)
@@ -39,8 +40,19 @@ unexpected shape at dispatch is an error.
 
 A slot's region is safe to rewrite once the next layer's count exchange of
 that slot (NCCL, every rank takes part, in slot order) has happened: by then
-the previous rows were consumed. The notification carries the plan sequence
-number, which advances identically on every rank.
+the previous rows were consumed (their copy to the GPU enqueued on the
+stream the exchange is ordered after). The notification carries the plan
+sequence number, which advances identically on every rank.
+
+Host staging (``VLLM_P2P_NIXL_HOST_STAGING``, on by default): the engine
+itself moves the rows between the GPU and the pinned regions / send buffers,
+with asynchronous copies on the current stream (packed rows and partial sums
+GPU -> host before the WRITE, received rows host -> GPU in the gather), so
+UCX only sends host memory over TCP and makes no CUDA calls. With
+``VLLM_P2P_NIXL_HOST_STAGING=0`` the regions are GPU memory and UCX copies
+between the GPU and its TCP buffers itself, with a synchronous CUDA copy
+inside ``transfer()``; in the AFD connector, which has the same layout, one
+of those copies was seen never to return.
 
 Same principle as afd-plugin's ``NixlRoutedAFDConnector`` (the AFD one-hop
 NIXL connector), written here because the EP all2all lives in vLLM and
@@ -50,6 +62,7 @@ cannot import the plugin. Limitation: unquantized rows only (no fp8 wire).
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -71,6 +84,9 @@ NIXL_BACKEND = "UCX"
 # A stalled peer surfaces as an error instead of a hang (same as the AFD
 # connector's NCCL groups).
 TRANSFER_TIMEOUT_S = 120.0
+# VLLM_P2P_NIXL_HOST_STAGING=0: register GPU memory with NIXL instead of
+# pinned host buffers (see "Host staging" in the module docstring).
+_HOST_STAGING = os.environ.get("VLLM_P2P_NIXL_HOST_STAGING", "1") != "0"
 
 
 def _agent_name(rank: int) -> str:
@@ -110,10 +126,13 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         if num_slots < 1:
             raise ValueError("num_slots must be positive")
         self.num_slots = num_slots
-        # NIXL memory type of the regions: GPU memory in serving, host memory
-        # when the engine runs on CPU tensors (tests).
-        self._mem_type = "VRAM" if self.device.type == "cuda" else "DRAM"
-        self._device_id = self.device.index or 0
+        # NIXL memory type of the regions: pinned host memory under host
+        # staging, GPU memory otherwise; host memory when the engine runs on
+        # CPU tensors (tests).
+        self._host_staging = _HOST_STAGING
+        on_gpu = self.device.type == "cuda" and not self._host_staging
+        self._mem_type = "VRAM" if on_gpu else "DRAM"
+        self._device_id = (self.device.index or 0) if on_gpu else 0
         self.agent = nixl_agent(
             _agent_name(self.rank), nixl_agent_config(backends=[NIXL_BACKEND])
         )
@@ -126,6 +145,12 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # Registered send buffers (same size): the WRITE source must be
         # registered memory as well.
         self._sends: dict[tuple, torch.Tensor] = {}
+        # Under host staging, per dispatch key: the GPU buffer the rows are
+        # packed into before they are copied into the pinned send buffer.
+        self._packs: dict[tuple, torch.Tensor] = {}
+        # (slot, "d" | "c") -> "the last gather out of that slot's regions
+        # has run", so the host may overwrite this rank's own share in them.
+        self._gathered: dict[tuple[int, str], Callable[[], bool]] = {}
         # Per region key: rank -> (base address, row bytes) of the peers'
         # regions and the peers' device ids, exchanged over the NCCL group.
         self._peer_regions: dict[tuple, list[tuple[int, int]]] = {}
@@ -151,14 +176,21 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     def _alloc(self, key: tuple) -> None:
         """Allocate and register the receive region and the send buffer of
         ``key`` (``(kind, tail, dtype)``), plus the gather buffer."""
-        _, tail, dtype = key
+        kind, tail, dtype = key
         rows = self.num_slots * self.world_size * self.max_tokens_per_rank
-        region = torch.empty((rows, *tail), dtype=dtype, device=self.device)
-        send = torch.empty_like(region)
+        where = torch.device("cpu") if self._host_staging else self.device
+        pin = self._host_staging and self.device.type == "cuda"
+        region = torch.empty((rows, *tail), dtype=dtype, device=where, pin_memory=pin)
+        send = torch.empty((rows, *tail), dtype=dtype, device=where, pin_memory=pin)
         self.agent.register_memory([region, send])
         self._regions[key] = region
         self._sends[key] = send
-        self._gathers[key] = torch.empty_like(region)
+        self._gathers[key] = torch.empty((rows, *tail), dtype=dtype, device=self.device)
+        if self._host_staging and kind != "back":
+            # combine_send copies the partial sums straight from the GPU.
+            self._packs[key] = torch.empty(
+                (rows, *tail), dtype=dtype, device=self.device
+            )
 
     def _register_agents(self) -> None:
         """Exchange agent metadata (which carries the registered regions) and
@@ -170,13 +202,14 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                 key: (region.data_ptr(), region[0].numel() * region.element_size())
                 for key, region in self._regions.items()
             },
-            self.num_slots,
+            (self.num_slots, self._mem_type),
         )
         everyone: list[Any] = [None] * self.world_size
         dist.all_gather_object(everyone, mine, group=self.group)
-        if {info[3] for info in everyone} != {self.num_slots}:
+        if {info[3] for info in everyone} != {(self.num_slots, self._mem_type)}:
             raise RuntimeError(
-                "p2p_nixl: every rank needs the same micro-batch count, got "
+                "p2p_nixl: every rank needs the same micro-batch count and "
+                "VLLM_P2P_NIXL_HOST_STAGING, got "
                 f"{[info[3] for info in everyone]}"
             )
         self._peer_devices = [info[1] for info in everyone]
@@ -310,15 +343,18 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     def _post(
         self,
         slot: int,
+        kind: str,
         packed: list[tuple[tuple, torch.Tensor]],
         send_counts: list[int],
         notif: bytes,
     ) -> None:
         """Move every ``(key, rows)`` of ``packed`` (destination-major,
         ``send_counts``, views of the slot's registered send buffers) to its
-        owners: the local share is copied on the current stream, the others
-        get one WRITE per peer (all keys in it, one notification) once the
-        current stream has produced the rows."""
+        owners once the current stream has produced the rows: the local share
+        is copied into this rank's own region of ``kind`` (on the current
+        stream; by the host under host staging, after the region's previous
+        gather has run), the others get one WRITE per peer (all keys in it,
+        one notification)."""
         R = self.max_tokens_per_rank
         self._wait_until(self._stream_done(), "packing")
         offset = 0
@@ -326,6 +362,9 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             if count:
                 shares = [(key, rows[offset : offset + count]) for key, rows in packed]
                 if peer == self.rank:
+                    gathered = self._gathered.get((slot, kind))
+                    if self._host_staging and gathered is not None:
+                        self._wait_until(gathered, "previous gather")
                     for key, share in shares:
                         region = self._regions[key][self._slot_rows(slot)]
                         region[self.rank * R : self.rank * R + count].copy_(share)
@@ -355,8 +394,18 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             parts = [
                 region[p * R : p * R + c] for p, c in enumerate(pending.recv_counts)
             ]
-            if num_in:
+            if not num_in:
+                continue
+            if not self._host_staging:
                 torch.cat(parts, out=gather[:num_in])
+                continue
+            # Pinned host -> GPU, asynchronous like a kernel.
+            row = 0
+            for part in parts:
+                gather[row : row + part.shape[0]].copy_(part, non_blocking=True)
+                row += part.shape[0]
+        if self._host_staging:
+            self._gathered[(slot, kind)] = self._stream_done()
 
     def dispatch(
         self,
@@ -397,8 +446,16 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                 raise RuntimeError("p2p_nixl carries unquantized rows only")
             key = self._region(f"recv{i}", tuple(x.shape[1:]), x.dtype)
             rows_out = self._sends[key][self._slot_rows(slot)][:num_send]
+            pack = self._packs.get(key)
             if num_send > 0:
-                torch.index_select(x, 0, plan.perm, out=rows_out)
+                if pack is None:
+                    torch.index_select(x, 0, plan.perm, out=rows_out)
+                else:
+                    # Pack on the GPU, then into the pinned send buffer on the
+                    # same stream (_post waits for the stream before the WRITE).
+                    packed_rows = pack[self._slot_rows(slot)][:num_send]
+                    torch.index_select(x, 0, plan.perm, out=packed_rows)
+                    rows_out.copy_(packed_rows, non_blocking=True)
             packed.append((key, rows_out))
             rows = max(plan.num_recv, min_rows)
             recv = self._gathers[key][self._slot_rows(slot)][:rows]
@@ -411,7 +468,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # One WRITE per peer carrying hidden, ids and weights, so one
         # notification per peer announces the whole share.
         with torch.profiler.record_function(f"p2p_nixl.dispatch_post[{slot}]"):
-            self._post(slot, packed, plan.send_counts, notif)
+            self._post(slot, "d", packed, plan.send_counts, notif)
         self._pending[(slot, "d")] = _PendingReceive(
             notif=notif, recv_counts=plan.recv_counts, keys=keys, out_rows=out_rows
         )
@@ -439,10 +496,12 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # send_counts (its own tokens' partials, perm order).
         key = self._region("back", tuple(partial.shape[1:]), partial.dtype)
         staged = self._sends[key][self._slot_rows(slot)][: plan.num_recv]
-        staged.copy_(partial)
+        # Under host staging GPU -> pinned host, asynchronous; _post waits for
+        # the stream before the WRITE.
+        staged.copy_(partial, non_blocking=True)
         notif = f"c{plan.seq}".encode()
         with torch.profiler.record_function(f"p2p_nixl.combine_post[{slot}]"):
-            self._post(slot, [(key, staged)], plan.recv_counts, notif)
+            self._post(slot, "c", [(key, staged)], plan.recv_counts, notif)
         self._pending[(slot, "c")] = _PendingReceive(
             notif=notif,
             recv_counts=plan.send_counts,
