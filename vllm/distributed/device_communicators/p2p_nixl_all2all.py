@@ -235,6 +235,12 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             )
         return key
 
+    @property
+    def host_staging(self) -> bool:
+        """Whether the NIXL regions are pinned host memory (see the module
+        docstring)."""
+        return self._host_staging
+
     def _slot_rows(self, slot: int) -> slice:
         """Rows of ``slot`` in a region / send / gather buffer."""
         size = self.world_size * self.max_tokens_per_rank
