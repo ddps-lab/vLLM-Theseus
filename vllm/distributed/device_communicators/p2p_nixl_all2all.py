@@ -93,6 +93,13 @@ def _agent_name(rank: int) -> str:
     return f"p2p-nixl-{rank}"
 
 
+def _mark(name: str) -> None:
+    """A point in time in profiler traces: a range of zero length (only the
+    range bookkeeping when the profiler is off)."""
+    with torch.profiler.record_function(name):
+        pass
+
+
 @dataclass(frozen=True)
 class _PendingReceive:
     """Rows WRITTEN to this rank, not yet waited for: per region key, the
@@ -293,7 +300,9 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             self._peer_agents[peer],
             notif,
         )
-        if self.agent.transfer(handle) == "ERR":
+        state = self.agent.transfer(handle)
+        _mark(f"p2p_nixl.write_post[{slot}:{notif.decode()}:{peer}]")
+        if state == "ERR":
             raise RuntimeError(f"p2p_nixl: WRITE to rank {peer} failed to post")
         self._writes.setdefault(slot, []).append(handle)
 
@@ -312,6 +321,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                     remaining.append(handle)
                 elif state == "DONE":
                     self.agent.release_xfer_handle(handle)
+                    _mark(f"p2p_nixl.write_done[{slot}]")
                 else:
                     raise RuntimeError(f"p2p_nixl: WRITE ended in state {state}")
             if remaining:
@@ -339,6 +349,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
 
         def done() -> bool:
             for name, notifs in self.agent.get_new_notifs().items():
+                for notif in notifs:
+                    _mark(f"p2p_nixl.notif_in[{notif.decode()}:{name}]")
                 self._notifs.setdefault(name, []).extend(notifs)
             for name in [n for n in missing if missing[n] in self._notifs.get(n, [])]:
                 self._notifs[name].remove(missing.pop(name))
