@@ -336,28 +336,32 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         self,
         slot: int,
         peer: int,
-        shares: list[tuple[tuple, torch.Tensor]],
+        local: list[tuple[tuple, int, int]],
+        count: int,
         notif: bytes,
     ) -> None:
-        """One WRITE of every ``(key, rows)`` of ``shares`` into this rank's
-        share of ``slot`` in ``peer``'s regions, followed by one ``notif``."""
+        """One WRITE of ``count`` rows from every ``(key, address, row bytes)``
+        of ``local`` (rows of this rank's registered send buffers) into this
+        rank's share of ``slot`` in ``peer``'s regions, followed by one
+        ``notif``. The descriptors are built from addresses, which costs less
+        host time than slicing the tensors for NIXL to read back."""
         first_row = (slot * self.world_size + self.rank) * self.max_tokens_per_rank
-        local: list[torch.Tensor] = []
-        remote: list[tuple[int, int, int]] = []
-        for key, rows in shares:
-            addr, row_bytes = self._peer_regions[key][peer]
-            local.append(rows)
-            remote.append(
+        src: list[tuple[int, int, int]] = []
+        dst: list[tuple[int, int, int]] = []
+        for key, addr, row_bytes in local:
+            peer_addr, peer_row_bytes = self._peer_regions[key][peer]
+            src.append((addr, count * row_bytes, self._device_id))
+            dst.append(
                 (
-                    addr + first_row * row_bytes,
-                    rows.shape[0] * row_bytes,
+                    peer_addr + first_row * peer_row_bytes,
+                    count * peer_row_bytes,
                     self._peer_devices[peer],
                 )
             )
         handle = self.agent.initialize_xfer(
             "WRITE",
-            self.agent.get_xfer_descs(local),
-            self.agent.get_xfer_descs(remote, self._mem_type),
+            self.agent.get_xfer_descs(src, self._mem_type),
+            self.agent.get_xfer_descs(dst, self._mem_type),
             self._peer_agents[peer],
             notif,
         )
@@ -461,27 +465,32 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         notifies only the peers it WRITES to."""
         R = self.max_tokens_per_rank
         self._wait_until(self._stream_done(), "packing")
+        # (key, address of the first row, row bytes) of every packed tensor.
+        sources = [
+            (key, rows.data_ptr(), rows.stride(0) * rows.element_size())
+            for key, rows in packed
+        ]
         offset = 0
         for peer, count in enumerate(send_counts):
-            shares = [(key, rows[offset : offset + count]) for key, rows in packed]
-            offset += count
             if peer == self.rank:
                 if count:
                     gathered = self._gathered.get((slot, kind))
                     if self._host_staging and gathered is not None:
                         self._wait_until(gathered, "previous gather")
-                    for key, share in shares:
+                    for key, rows in packed:
                         region = self._regions[key][self._slot_rows(slot)]
-                        region[self.rank * R : self.rank * R + count].copy_(share)
-            elif kind == "d":
-                tagged = notif + f":{count}".encode()
-                if count:
-                    self._write(slot, peer, shares, tagged)
-                else:
-                    self.agent.send_notif(self._peer_agents[peer], tagged)
-                    _mark(f"p2p_nixl.write_post[{slot}:{tagged.decode()}:{peer}]")
+                        region[self.rank * R : self.rank * R + count].copy_(
+                            rows[offset : offset + count]
+                        )
             elif count:
-                self._write(slot, peer, shares, notif)
+                local = [(key, addr + offset * rb, rb) for key, addr, rb in sources]
+                tagged = notif + f":{count}".encode() if kind == "d" else notif
+                self._write(slot, peer, local, count, tagged)
+            elif kind == "d":
+                tagged = notif + b":0"
+                self.agent.send_notif(self._peer_agents[peer], tagged)
+                _mark(f"p2p_nixl.write_post[{slot}:{tagged.decode()}:{peer}]")
+            offset += count
 
     def _receive(self, slot: int, kind: str) -> None:
         """Wait for the rows of (``slot``, ``kind``) and gather each key's
