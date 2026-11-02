@@ -310,12 +310,16 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dbo_yield_and_switch_from_compute_to_comm()
         self.engine.exchange_counts(pending)
         plan = self.engine.finish_plan(pending)
+        # An engine whose rows carry their counts (NIXL) knows num_recv only
+        # after dispatch_wait; _fixed_rows covers every rank's full share, so
+        # the fixed-size launch always fits then.
+        counts_known = plan.num_recv is not None
         fixed = (
             self._fixed_launch_ok()
             and quant_config.quant_dtype is None
-            and plan.num_recv <= self._fixed_rows
+            and (not counts_known or plan.num_recv <= self._fixed_rows)
         )
-        if plan.num_recv > self._fixed_rows:
+        if counts_known and plan.num_recv > self._fixed_rows:
             if not self._fixed_overflow_logged:
                 logger.warning(
                     "p2p_nccl P/F rank=%d: received %d rows > fixed launch size "
@@ -326,7 +330,7 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         received = self.engine.dispatch(
             plan, tuple(tensors), min_rows=self._fixed_rows if fixed else 0
         )
-        if not fixed:
+        if not fixed and counts_known:
             received = [r[: plan.num_recv] for r in received]
         recv_a1, recv_ids, recv_weights = received[0], received[1], received[2]
         recv_scale = received[3] if scale_to_send is not None else None
@@ -334,8 +338,16 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         dbo_switch_to_compute_sync()
 
         def receiver() -> mk.PrepareResultType:
+            nonlocal recv_a1, recv_ids, recv_weights, recv_scale
             if self.engine.deferred_receive:
                 self.engine.dispatch_wait(plan)
+            if not fixed and not counts_known:
+                # The counts arrived with the rows: trim the views now.
+                recv_a1 = recv_a1[: plan.num_recv]
+                recv_ids = recv_ids[: plan.num_recv]
+                recv_weights = recv_weights[: plan.num_recv]
+                if recv_scale is not None:
+                    recv_scale = recv_scale[: plan.num_recv]
             # The ids are global and the experts kernel skips the slots whose
             # expert_map entry is -1 (align/sum kernels and the Triton kernel
             # all do), so the received ids and weights pass through as they

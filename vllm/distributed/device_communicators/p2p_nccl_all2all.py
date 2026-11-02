@@ -14,7 +14,10 @@ Per MoE layer the engine performs three steps:
   the host. That copy is the single CPU sync of the layer; NCCL needs
   host-side counts to post the receives. The three sub-steps are exposed
   separately so that a caller can move to another stream or yield to another
-  micro-batch between them (dual batch overlap).
+  micro-batch between them (dual batch overlap). A transport whose rows carry
+  their count (the NIXL engine) skips the exchange: ``finish_plan_local``
+  copies only this rank's send counts and the receive counts are filled in
+  when the rows arrive (``set_recv_counts``).
 * ``dispatch``: pack the local tokens in destination order and ship them with
   a variable-split ``all_to_all_single`` into preallocated max-size buffers,
   so no per-layer allocation happens ("max buffer" variant).
@@ -89,9 +92,11 @@ class P2pAll2AllPlan:
     slot: int
     num_tokens: int
     send_counts: list[int]
-    recv_counts: list[int]
+    # None until the rows have arrived when the counts travel with the rows
+    # (``finish_plan_local``, the NIXL transports); set by ``set_recv_counts``.
+    recv_counts: list[int] | None
     num_send: int
-    num_recv: int
+    num_recv: int | None
     # Local token index of every packed row, in destination-major order.
     perm: torch.Tensor
     # Sequence number of this plan on this rank (diagnostics).
@@ -166,6 +171,8 @@ class P2pAll2AllEngine:
         # tokens and grow geometrically on demand (rare after warm-up).
         self.capacity = max_tokens_per_rank
         self._arange_r = torch.arange(world_size, device=self.device)
+        # [world_size, 1, 1]: compared against [1, T, top_k] destination ranks.
+        self._arange_r3 = self._arange_r.view(world_size, 1, 1)
         # Owning rank of every global expert for an uneven placement.
         self._expert_owner = (
             None
@@ -203,7 +210,6 @@ class P2pAll2AllEngine:
         """Device-only part of the plan: destinations, send counts, ordering."""
         num_tokens = topk_ids.shape[0]
         world = self.world_size
-        device = self.device
 
         if num_tokens == 0:
             # Nothing to send: zero the send counts once per slot (they stay
@@ -218,27 +224,25 @@ class P2pAll2AllEngine:
             )
         self._zero_send_slots.discard(slot)
 
-        ids = topk_ids.to(torch.int64)
         if self._expert_owner is None:
-            rank_of = torch.div(ids, self.num_local_experts, rounding_mode="floor")
+            # Floor division keeps padding ids (< 0) negative: no rank matches.
+            rank_of = torch.div(topk_ids, self.num_local_experts, rounding_mode="floor")
         else:
             # Padding ids (< 0) must not index the table from its end.
+            ids = topk_ids.long()
             rank_of = torch.where(ids >= 0, self._expert_owner[ids.clamp(min=0)], -1)
-        # dest[t, r]: token t has to visit rank r (at most once per rank).
-        # Negative ids (padding) match no rank.
-        dest = (rank_of.unsqueeze(-1) == self._arange_r).any(dim=1)
-        self._count_buf(slot)[0].copy_(dest.sum(dim=0, dtype=torch.int64))
+        # dest[r, t]: token t has to visit rank r (at most once per rank),
+        # destination-major. Negative ids (padding) match no rank.
+        dest = (rank_of.unsqueeze(0) == self._arange_r3).any(dim=2)
+        torch.sum(dest, dim=1, out=self._count_buf(slot)[0])
 
-        # Destination-major ordering with a fixed-length sort: the key of
-        # pair (r, t) is r * T + t when the token goes to r, otherwise a
-        # sentinel that sorts last. No data-dependent shapes on device.
-        key_base = self._arange_r.unsqueeze(1) * num_tokens + torch.arange(
-            num_tokens, device=device
-        ).unsqueeze(0)
-        key = torch.where(
-            dest.t(), key_base, torch.full_like(key_base, world * num_tokens)
-        )
-        order = key.reshape(-1).argsort()
+        # Destination-major order without a sort: pair (r, t) has the flat
+        # index r * T + t in ``dest``, and nonzero_static lists the visited
+        # pairs in that order, padded to a fixed length (no data-dependent
+        # shapes, no host sync).
+        order = torch.nonzero_static(
+            dest.view(-1), size=world * num_tokens, fill_value=world * num_tokens
+        ).view(-1)
         return P2pAll2AllPendingPlan(slot=slot, num_tokens=num_tokens, order=order)
 
     def exchange_counts(self, pending: P2pAll2AllPendingPlan) -> None:
@@ -252,6 +256,62 @@ class P2pAll2AllEngine:
         t0 = time.perf_counter()
         send_counts, recv_counts = self._count_buf(pending.slot).tolist()
         host_wait_ms = (time.perf_counter() - t0) * 1e3
+        return self._make_plan(pending, send_counts, recv_counts, host_wait_ms)
+
+    def finish_plan_local(self, pending: P2pAll2AllPendingPlan) -> P2pAll2AllPlan:
+        """``finish_plan`` without ``exchange_counts``: copy only this rank's
+        send counts to the host.
+
+        For a transport whose rows carry their count (the NIXL ones: every
+        notification says how many rows it announces), the receive side of
+        the plan (``recv_counts``, ``num_recv``) stays ``None`` until the rows
+        have arrived, see ``set_recv_counts``. The host copy still waits for
+        this rank's own plan kernels, but for no other rank.
+        """
+        t0 = time.perf_counter()
+        send_counts = self._count_buf(pending.slot)[0].tolist()
+        host_wait_ms = (time.perf_counter() - t0) * 1e3
+        return self._make_plan(pending, send_counts, None, host_wait_ms)
+
+    def next_plan_seq(self) -> int:
+        """Take the next plan sequence number.
+
+        Every rank numbers its plans in the same order (one per layer and
+        micro-batch). A rank that only receives and learns its counts from
+        the arriving rows takes the number before waiting for them (the
+        notifications carry it) and builds the plan with ``recv_plan``.
+        """
+        seq = self._num_plans
+        self._num_plans += 1
+        return seq
+
+    def recv_plan(self, slot: int, seq: int, recv_counts: list[int]) -> P2pAll2AllPlan:
+        """Plan of a rank without tokens of its own that received
+        ``recv_counts`` rows per source rank (sends nothing)."""
+        return P2pAll2AllPlan(
+            slot=slot,
+            num_tokens=0,
+            send_counts=[0] * self.world_size,
+            recv_counts=list(recv_counts),
+            num_send=0,
+            num_recv=sum(recv_counts),
+            perm=self._empty_order,
+            seq=seq,
+        )
+
+    @staticmethod
+    def set_recv_counts(plan: P2pAll2AllPlan, recv_counts: list[int]) -> None:
+        """Complete a ``finish_plan_local`` plan once its rows have arrived."""
+        plan.recv_counts = list(recv_counts)
+        plan.num_recv = sum(recv_counts)
+
+    def _make_plan(
+        self,
+        pending: P2pAll2AllPendingPlan,
+        send_counts: list[int],
+        recv_counts: list[int] | None,
+        host_wait_ms: float,
+    ) -> P2pAll2AllPlan:
         num_send = sum(send_counts)
         num_tokens = pending.num_tokens
         stream = _current_stream(self.device)
@@ -265,15 +325,14 @@ class P2pAll2AllEngine:
             if num_tokens > 0
             else self._empty_order
         )
-        seq = self._num_plans
-        self._num_plans += 1
+        seq = self.next_plan_seq()
         plan = P2pAll2AllPlan(
             slot=pending.slot,
             num_tokens=num_tokens,
             send_counts=send_counts,
             recv_counts=recv_counts,
             num_send=num_send,
-            num_recv=sum(recv_counts),
+            num_recv=None if recv_counts is None else sum(recv_counts),
             perm=perm,
             seq=seq,
             host_wait_ms=host_wait_ms,
@@ -282,7 +341,7 @@ class P2pAll2AllEngine:
         if _DEBUG and _should_log(seq):
             logger.info(
                 "p2p_nccl[r%d] plan#%d slot=%d T=%d send=%s recv=%s "
-                "n_send=%d n_recv=%d host_wait=%.3fms",
+                "n_send=%d n_recv=%s host_wait=%.3fms",
                 self.rank, seq, pending.slot, num_tokens, send_counts,
                 recv_counts, num_send, plan.num_recv, host_wait_ms,
             )
@@ -474,7 +533,7 @@ class P2pAll2AllEngine:
         )
         acc.zero_()
         acc.index_add_(0, plan.perm, back.to(torch.float32))
-        out.copy_(acc.to(out.dtype))
+        out.copy_(acc)  # casts in the copy, no intermediate tensor
         return out
 
     def combine(
