@@ -533,7 +533,7 @@ class P2pAll2AllEngine:
         )
         acc.zero_()
         acc.index_add_(0, plan.perm, back.to(torch.float32))
-        out.copy_(acc.to(out.dtype))
+        out.copy_(acc)  # casts in the copy, no intermediate tensor
         return out
 
     def combine(
