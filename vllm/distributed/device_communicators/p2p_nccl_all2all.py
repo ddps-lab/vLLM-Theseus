@@ -171,6 +171,8 @@ class P2pAll2AllEngine:
         # tokens and grow geometrically on demand (rare after warm-up).
         self.capacity = max_tokens_per_rank
         self._arange_r = torch.arange(world_size, device=self.device)
+        # [world_size, 1, 1]: compared against [1, T, top_k] destination ranks.
+        self._arange_r3 = self._arange_r.view(world_size, 1, 1)
         # Owning rank of every global expert for an uneven placement.
         self._expert_owner = (
             None
@@ -208,7 +210,6 @@ class P2pAll2AllEngine:
         """Device-only part of the plan: destinations, send counts, ordering."""
         num_tokens = topk_ids.shape[0]
         world = self.world_size
-        device = self.device
 
         if num_tokens == 0:
             # Nothing to send: zero the send counts once per slot (they stay
@@ -223,27 +224,25 @@ class P2pAll2AllEngine:
             )
         self._zero_send_slots.discard(slot)
 
-        ids = topk_ids.to(torch.int64)
         if self._expert_owner is None:
-            rank_of = torch.div(ids, self.num_local_experts, rounding_mode="floor")
+            # Floor division keeps padding ids (< 0) negative: no rank matches.
+            rank_of = torch.div(topk_ids, self.num_local_experts, rounding_mode="floor")
         else:
             # Padding ids (< 0) must not index the table from its end.
+            ids = topk_ids.long()
             rank_of = torch.where(ids >= 0, self._expert_owner[ids.clamp(min=0)], -1)
-        # dest[t, r]: token t has to visit rank r (at most once per rank).
-        # Negative ids (padding) match no rank.
-        dest = (rank_of.unsqueeze(-1) == self._arange_r).any(dim=1)
-        self._count_buf(slot)[0].copy_(dest.sum(dim=0, dtype=torch.int64))
+        # dest[r, t]: token t has to visit rank r (at most once per rank),
+        # destination-major. Negative ids (padding) match no rank.
+        dest = (rank_of.unsqueeze(0) == self._arange_r3).any(dim=2)
+        torch.sum(dest, dim=1, out=self._count_buf(slot)[0])
 
-        # Destination-major ordering with a fixed-length sort: the key of
-        # pair (r, t) is r * T + t when the token goes to r, otherwise a
-        # sentinel that sorts last. No data-dependent shapes on device.
-        key_base = self._arange_r.unsqueeze(1) * num_tokens + torch.arange(
-            num_tokens, device=device
-        ).unsqueeze(0)
-        key = torch.where(
-            dest.t(), key_base, torch.full_like(key_base, world * num_tokens)
-        )
-        order = key.reshape(-1).argsort()
+        # Destination-major order without a sort: pair (r, t) has the flat
+        # index r * T + t in ``dest``, and nonzero_static lists the visited
+        # pairs in that order, padded to a fixed length (no data-dependent
+        # shapes, no host sync).
+        order = torch.nonzero_static(
+            dest.view(-1), size=world * num_tokens, fill_value=world * num_tokens
+        ).view(-1)
         return P2pAll2AllPendingPlan(slot=slot, num_tokens=num_tokens, order=order)
 
     def exchange_counts(self, pending: P2pAll2AllPendingPlan) -> None:
