@@ -14,7 +14,10 @@ Per MoE layer the engine performs three steps:
   the host. That copy is the single CPU sync of the layer; NCCL needs
   host-side counts to post the receives. The three sub-steps are exposed
   separately so that a caller can move to another stream or yield to another
-  micro-batch between them (dual batch overlap).
+  micro-batch between them (dual batch overlap). A transport whose rows carry
+  their count (the NIXL engine) skips the exchange: ``finish_plan_local``
+  copies only this rank's send counts and the receive counts are filled in
+  when the rows arrive (``set_recv_counts``).
 * ``dispatch``: pack the local tokens in destination order and ship them with
   a variable-split ``all_to_all_single`` into preallocated max-size buffers,
   so no per-layer allocation happens ("max buffer" variant).
@@ -89,9 +92,11 @@ class P2pAll2AllPlan:
     slot: int
     num_tokens: int
     send_counts: list[int]
-    recv_counts: list[int]
+    # None until the rows have arrived when the counts travel with the rows
+    # (``finish_plan_local``, the NIXL transports); set by ``set_recv_counts``.
+    recv_counts: list[int] | None
     num_send: int
-    num_recv: int
+    num_recv: int | None
     # Local token index of every packed row, in destination-major order.
     perm: torch.Tensor
     # Sequence number of this plan on this rank (diagnostics).
@@ -252,6 +257,62 @@ class P2pAll2AllEngine:
         t0 = time.perf_counter()
         send_counts, recv_counts = self._count_buf(pending.slot).tolist()
         host_wait_ms = (time.perf_counter() - t0) * 1e3
+        return self._make_plan(pending, send_counts, recv_counts, host_wait_ms)
+
+    def finish_plan_local(self, pending: P2pAll2AllPendingPlan) -> P2pAll2AllPlan:
+        """``finish_plan`` without ``exchange_counts``: copy only this rank's
+        send counts to the host.
+
+        For a transport whose rows carry their count (the NIXL ones: every
+        notification says how many rows it announces), the receive side of
+        the plan (``recv_counts``, ``num_recv``) stays ``None`` until the rows
+        have arrived, see ``set_recv_counts``. The host copy still waits for
+        this rank's own plan kernels, but for no other rank.
+        """
+        t0 = time.perf_counter()
+        send_counts = self._count_buf(pending.slot)[0].tolist()
+        host_wait_ms = (time.perf_counter() - t0) * 1e3
+        return self._make_plan(pending, send_counts, None, host_wait_ms)
+
+    def next_plan_seq(self) -> int:
+        """Take the next plan sequence number.
+
+        Every rank numbers its plans in the same order (one per layer and
+        micro-batch). A rank that only receives and learns its counts from
+        the arriving rows takes the number before waiting for them (the
+        notifications carry it) and builds the plan with ``recv_plan``.
+        """
+        seq = self._num_plans
+        self._num_plans += 1
+        return seq
+
+    def recv_plan(self, slot: int, seq: int, recv_counts: list[int]) -> P2pAll2AllPlan:
+        """Plan of a rank without tokens of its own that received
+        ``recv_counts`` rows per source rank (sends nothing)."""
+        return P2pAll2AllPlan(
+            slot=slot,
+            num_tokens=0,
+            send_counts=[0] * self.world_size,
+            recv_counts=list(recv_counts),
+            num_send=0,
+            num_recv=sum(recv_counts),
+            perm=self._empty_order,
+            seq=seq,
+        )
+
+    @staticmethod
+    def set_recv_counts(plan: P2pAll2AllPlan, recv_counts: list[int]) -> None:
+        """Complete a ``finish_plan_local`` plan once its rows have arrived."""
+        plan.recv_counts = list(recv_counts)
+        plan.num_recv = sum(recv_counts)
+
+    def _make_plan(
+        self,
+        pending: P2pAll2AllPendingPlan,
+        send_counts: list[int],
+        recv_counts: list[int] | None,
+        host_wait_ms: float,
+    ) -> P2pAll2AllPlan:
         num_send = sum(send_counts)
         num_tokens = pending.num_tokens
         stream = _current_stream(self.device)
@@ -265,15 +326,14 @@ class P2pAll2AllEngine:
             if num_tokens > 0
             else self._empty_order
         )
-        seq = self._num_plans
-        self._num_plans += 1
+        seq = self.next_plan_seq()
         plan = P2pAll2AllPlan(
             slot=pending.slot,
             num_tokens=num_tokens,
             send_counts=send_counts,
             recv_counts=recv_counts,
             num_send=num_send,
-            num_recv=sum(recv_counts),
+            num_recv=None if recv_counts is None else sum(recv_counts),
             perm=perm,
             seq=seq,
             host_wait_ms=host_wait_ms,
@@ -282,7 +342,7 @@ class P2pAll2AllEngine:
         if _DEBUG and _should_log(seq):
             logger.info(
                 "p2p_nccl[r%d] plan#%d slot=%d T=%d send=%s recv=%s "
-                "n_send=%d n_recv=%d host_wait=%.3fms",
+                "n_send=%d n_recv=%s host_wait=%.3fms",
                 self.rank, seq, pending.slot, num_tokens, send_counts,
                 recv_counts, num_send, plan.num_recv, host_wait_ms,
             )

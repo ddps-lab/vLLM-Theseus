@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """[theseus p2p_nixl] Point-to-point MoE all2all with the rows carried by NIXL.
 
-``P2pNixlAll2AllEngine`` keeps everything of ``P2pAll2AllEngine`` (the
-per-layer count exchange over NCCL, the plan, the fixed-size launch
-bookkeeping, the fp32 accumulation of the returned partials) and replaces
-only the two data movements, ``dispatch`` and ``combine_send``: instead of
+``P2pNixlAll2AllEngine`` keeps the plan of ``P2pAll2AllEngine`` (which ranks
+every token visits, in destination order), the fixed-size launch bookkeeping
+and the fp32 accumulation of the returned partials, and replaces the two data
+movements, ``dispatch`` and ``combine_send``, and the count exchange: instead of
 ``all_to_all_single`` (NCCL kernels that hold the GPU until the peer's kernel
 has moved its share) the rows travel as one-sided NIXL WRITEs into the
 peer's pre-registered receive regions, followed by a notification. The GPU
@@ -38,11 +38,20 @@ leave the peers with no backend able to reach the region). The tensor shapes
 are therefore given to the constructor (hidden size, top-k, dtypes) and an
 unexpected shape at dispatch is an error.
 
-A slot's region is safe to rewrite once the next layer's count exchange of
-that slot (NCCL, every rank takes part, in slot order) has happened: by then
-the previous rows were consumed (their copy to the GPU enqueued on the
-stream the exchange is ordered after). The notification carries the plan
-sequence number, which advances identically on every rank.
+No count exchange: every dispatch notification carries its row count,
+``d<seq>:<rows>``, and a rank sends one to every peer on every dispatch (a
+bare notification, without a WRITE, when it has no rows for that peer). The
+receiver learns what each peer sent when its rows have arrived, so no rank
+waits for the others before sending. The plan sequence number advances
+identically on every rank (one plan per layer and micro-batch). A combine
+notification is ``c<seq>``: each rank knows how many partial sums come back
+(the rows it sent).
+
+A slot's region is safe to rewrite without a barrier: a rank sends the next
+rows of a slot to a peer only after the partial sums of the previous rows it
+sent that peer have come back, which the peer posts after its gather of those
+rows has run (``_post`` waits for the stream first). Where a rank sent a peer
+no rows, that peer had nothing to gather from its region.
 
 Host staging (``VLLM_P2P_NIXL_HOST_STAGING``, on by default): the engine
 itself moves the rows between the GPU and the pinned regions / send buffers,
@@ -102,13 +111,16 @@ def _mark(name: str) -> None:
 
 @dataclass(frozen=True)
 class _PendingReceive:
-    """Rows WRITTEN to this rank, not yet waited for: per region key, the
-    source-major counts to gather and the rows of the result view."""
+    """Rows WRITTEN to this rank, not yet waited for, and the region keys to
+    gather them from. Dispatch: ``notif`` is the prefix ``d<seq>:`` of the
+    peers' notifications (they carry the counts) and ``plan`` gets the counts
+    once they are in. Combine: the exact ``c<seq>`` and the counts are
+    known (``recv_counts``, the rows this rank sent)."""
 
     notif: bytes
-    recv_counts: list[int]
     keys: list[tuple]
-    out_rows: list[int]
+    recv_counts: list[int] | None = None
+    plan: P2pAll2AllPlan | None = None
 
 
 class P2pNixlAll2AllEngine(P2pAll2AllEngine):
@@ -263,13 +275,19 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         event.record(torch.cuda.current_stream(self.device))
         return event.query
 
+    def exchange_counts(self, pending: P2pAll2AllPendingPlan) -> None:
+        """Nothing to exchange: the notifications carry the counts (see the
+        module docstring)."""
+        return None
+
     def finish_plan(self, pending: P2pAll2AllPendingPlan) -> P2pAll2AllPlan:
-        # The host copy of the counts would block in the stream sync; poll
-        # for the exchange instead so the posted WRITEs are serviced (their
-        # notifications only go out when their state is checked) meanwhile.
-        with torch.profiler.record_function("p2p_nixl.count_wait"):
-            self._wait_until(self._stream_done(), "count exchange")
-        return super().finish_plan(pending)
+        # The host copy of this rank's send counts would block in the stream
+        # sync; poll for the plan kernels instead so the posted WRITEs are
+        # serviced (their notifications only go out when their state is
+        # checked) meanwhile. The receive counts arrive with the rows.
+        with torch.profiler.record_function("p2p_nixl.plan_wait"):
+            self._wait_until(self._stream_done(), "plan")
+        return self.finish_plan_local(pending)
 
     def _write(
         self,
@@ -343,20 +361,43 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         """Wait until the WRITEs posted for ``slot`` have completed."""
         self._wait_until(lambda: slot not in self._writes, "WRITE")
 
+    def _collect_notifs(self) -> None:
+        for name, notifs in self.agent.get_new_notifs().items():
+            for notif in notifs:
+                _mark(f"p2p_nixl.notif_in[{notif.decode()}:{name}]")
+            self._notifs.setdefault(name, []).extend(notifs)
+
     def _wait_notifs(self, expected: dict[int, bytes]) -> None:
         """Wait for ``expected[peer]`` from every listed peer."""
         missing = {self._peer_agents[p]: n for p, n in expected.items()}
 
         def done() -> bool:
-            for name, notifs in self.agent.get_new_notifs().items():
-                for notif in notifs:
-                    _mark(f"p2p_nixl.notif_in[{notif.decode()}:{name}]")
-                self._notifs.setdefault(name, []).extend(notifs)
+            self._collect_notifs()
             for name in [n for n in missing if missing[n] in self._notifs.get(n, [])]:
                 self._notifs[name].remove(missing.pop(name))
             return not missing
 
         self._wait_until(done, f"notification from {sorted(missing)}")
+
+    def _wait_counts(self, prefix: bytes, peers: list[int]) -> dict[int, int]:
+        """Wait for the notification ``<prefix><rows>`` from every peer of
+        ``peers`` and return the row count each one announced."""
+        missing = {self._peer_agents[p]: p for p in peers}
+        counts: dict[int, int] = {}
+
+        def done() -> bool:
+            self._collect_notifs()
+            for name in list(missing):
+                notifs = self._notifs.get(name, [])
+                for notif in notifs:
+                    if notif.startswith(prefix):
+                        notifs.remove(notif)
+                        counts[missing.pop(name)] = int(notif[len(prefix) :])
+                        break
+            return not missing
+
+        self._wait_until(done, f"notification {prefix!r} from {sorted(missing)}")
+        return counts
 
     def _post(
         self,
@@ -372,23 +413,32 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         is copied into this rank's own region of ``kind`` (on the current
         stream; by the host under host staging, after the region's previous
         gather has run), the others get one WRITE per peer (all keys in it,
-        one notification)."""
+        one notification). A dispatch notifies every peer with its row count
+        (``<notif>:<rows>``, a bare notification for zero rows); a combine
+        notifies only the peers it WRITES to."""
         R = self.max_tokens_per_rank
         self._wait_until(self._stream_done(), "packing")
         offset = 0
         for peer, count in enumerate(send_counts):
-            if count:
-                shares = [(key, rows[offset : offset + count]) for key, rows in packed]
-                if peer == self.rank:
+            shares = [(key, rows[offset : offset + count]) for key, rows in packed]
+            offset += count
+            if peer == self.rank:
+                if count:
                     gathered = self._gathered.get((slot, kind))
                     if self._host_staging and gathered is not None:
                         self._wait_until(gathered, "previous gather")
                     for key, share in shares:
                         region = self._regions[key][self._slot_rows(slot)]
                         region[self.rank * R : self.rank * R + count].copy_(share)
+            elif kind == "d":
+                tagged = notif + f":{count}".encode()
+                if count:
+                    self._write(slot, peer, shares, tagged)
                 else:
-                    self._write(slot, peer, shares, notif)
-            offset += count
+                    self.agent.send_notif(self._peer_agents[peer], tagged)
+                    _mark(f"p2p_nixl.write_post[{slot}:{tagged.decode()}:{peer}]")
+            elif count:
+                self._write(slot, peer, shares, notif)
 
     def _receive(self, slot: int, kind: str) -> None:
         """Wait for the rows of (``slot``, ``kind``) and gather each key's
@@ -397,21 +447,36 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         always fits."""
         pending = self._pending.pop((slot, kind))
         self._finish_writes(slot)
-        self._wait_notifs(
-            {
-                p: pending.notif
-                for p, c in enumerate(pending.recv_counts)
-                if c and p != self.rank
-            }
-        )
+        if pending.plan is not None:
+            # Dispatch: every peer announces its rows (zero included).
+            plan = pending.plan
+            counts = self._wait_counts(
+                pending.notif, [p for p in range(self.world_size) if p != self.rank]
+            )
+            counts[self.rank] = plan.send_counts[self.rank]
+            recv_counts = [counts[p] for p in range(self.world_size)]
+            self.set_recv_counts(plan, recv_counts)
+        else:
+            recv_counts = pending.recv_counts
+            self._wait_notifs(
+                {
+                    p: pending.notif
+                    for p, c in enumerate(recv_counts)
+                    if c and p != self.rank
+                }
+            )
         R = self.max_tokens_per_rank
-        num_in = sum(pending.recv_counts)
+        num_in = sum(recv_counts)
         for key in pending.keys:
             region = self._regions[key][self._slot_rows(slot)]
             gather = self._gathers[key][self._slot_rows(slot)]
-            parts = [
-                region[p * R : p * R + c] for p, c in enumerate(pending.recv_counts)
-            ]
+            if pending.plan is not None:
+                # The rows past num_in may still hold ids of an earlier
+                # dispatch (see mask_rows_past), now that num_in is known.
+                dirty = (slot, gather.data_ptr())
+                if dirty in self._dirty_rows:
+                    self._dirty_rows[dirty] = max(self._dirty_rows[dirty], num_in)
+            parts = [region[p * R : p * R + c] for p, c in enumerate(recv_counts)]
             if not num_in:
                 continue
             if not self._host_staging:
@@ -432,10 +497,12 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         min_rows: int = 0,
     ) -> list[torch.Tensor]:
         """Same contract as the NCCL engine's ``dispatch`` (see there); the
-        rows travel as NIXL WRITEs and are only valid after ``dispatch_wait``.
-        ``min_rows`` views come from the slot's gather buffer, whose rows past
-        ``num_recv`` are handled by ``mask_rows_past`` exactly as for the NCCL
-        receive buffers."""
+        rows travel as NIXL WRITEs and are only valid after ``dispatch_wait``,
+        which also fills in the plan's receive counts. The views cover
+        ``min_rows`` rows (fixed-size launch) or the slot's whole share of the
+        gather buffer (the caller trims them to ``num_recv`` after the wait);
+        the rows past ``num_recv`` are handled by ``mask_rows_past`` exactly as
+        for the NCCL receive buffers."""
         slot = plan.slot
         if slot >= self.num_slots:
             raise RuntimeError(
@@ -453,8 +520,9 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             plan.perm.record_stream(stream)
         notif = f"d{plan.seq}".encode()
         keys: list[tuple] = []
-        out_rows: list[int] = []
         packed: list[tuple[tuple, torch.Tensor]] = []
+        # The receive counts are only known once the rows arrive.
+        rows = min_rows or self.world_size * self.max_tokens_per_rank
         for i, x in enumerate(tensors):
             if x.shape[0] != plan.num_tokens:
                 raise ValueError(
@@ -475,20 +543,14 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                     torch.index_select(x, 0, plan.perm, out=packed_rows)
                     rows_out.copy_(packed_rows, non_blocking=True)
             packed.append((key, rows_out))
-            rows = max(plan.num_recv, min_rows)
-            recv = self._gathers[key][self._slot_rows(slot)][:rows]
-            dirty = (slot, recv.data_ptr())
-            if dirty in self._dirty_rows:
-                self._dirty_rows[dirty] = max(self._dirty_rows[dirty], plan.num_recv)
             keys.append(key)
-            out_rows.append(rows)
-            outputs.append(recv)
+            outputs.append(self._gathers[key][self._slot_rows(slot)][:rows])
         # One WRITE per peer carrying hidden, ids and weights, so one
         # notification per peer announces the whole share.
         with torch.profiler.record_function(f"p2p_nixl.dispatch_post[{slot}]"):
             self._post(slot, "d", packed, plan.send_counts, notif)
         self._pending[(slot, "d")] = _PendingReceive(
-            notif=notif, recv_counts=plan.recv_counts, keys=keys, out_rows=out_rows
+            notif=notif + b":", keys=keys, plan=plan
         )
         return outputs
 
@@ -502,6 +564,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         """Return ``partial`` (``[num_recv, ...]``) to the owners as NIXL WRITEs;
         same contract as the NCCL engine's ``combine_send``, the returned rows
         being valid once ``combine_accumulate`` has waited for them."""
+        if plan.num_recv is None:
+            raise RuntimeError("p2p_nixl: combine_send before dispatch_wait")
         if partial.shape[0] != plan.num_recv:
             raise ValueError(
                 f"partial has {partial.shape[0]} rows, plan expects {plan.num_recv}"
@@ -521,10 +585,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         with torch.profiler.record_function(f"p2p_nixl.combine_post[{slot}]"):
             self._post(slot, "c", [(key, staged)], plan.recv_counts, notif)
         self._pending[(slot, "c")] = _PendingReceive(
-            notif=notif,
-            recv_counts=plan.send_counts,
-            keys=[key],
-            out_rows=[plan.num_send],
+            notif=notif, keys=[key], recv_counts=plan.send_counts
         )
         return self._gathers[key][self._slot_rows(slot)][: plan.num_send]
 
