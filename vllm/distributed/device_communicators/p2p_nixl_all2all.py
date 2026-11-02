@@ -63,6 +63,13 @@ between the GPU and its TCP buffers itself, with a synchronous CUDA copy
 inside ``transfer()``; in the AFD connector, which has the same layout, one
 of those copies was seen never to return.
 
+Progress thread (``VLLM_P2P_NIXL_PROGRESS_THREAD``, off by default): NIXL's
+Python agent polls the UCX worker from its progress thread with no pause, so
+that thread keeps a CPU core busy even when idle. Every host wait of this
+engine polls NIXL itself, so the transfers progress without it. Without it
+the agent uses ``NIXL_THREAD_SYNC_RW``, which keeps the UCX worker
+thread-safe for the micro-batch threads that call it in turn.
+
 Same principle as afd-plugin's ``NixlRoutedAFDConnector`` (the AFD one-hop
 NIXL connector), written here because the EP all2all lives in vLLM and
 cannot import the plugin. Limitation: unquantized rows only (no fp8 wire).
@@ -96,6 +103,9 @@ TRANSFER_TIMEOUT_S = 120.0
 # VLLM_P2P_NIXL_HOST_STAGING=0: register GPU memory with NIXL instead of
 # pinned host buffers (see "Host staging" in the module docstring).
 _HOST_STAGING = os.environ.get("VLLM_P2P_NIXL_HOST_STAGING", "1") != "0"
+# VLLM_P2P_NIXL_PROGRESS_THREAD=1: create the NIXL agent with its progress
+# thread (see "Progress thread" in the module docstring).
+_PROGRESS_THREAD = os.environ.get("VLLM_P2P_NIXL_PROGRESS_THREAD", "0") != "0"
 
 
 def _agent_name(rank: int) -> str:
@@ -142,6 +152,10 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         super().__init__(*args, **kwargs)
         from nixl import nixl_agent, nixl_agent_config  # noqa: PLC0415
 
+        # Not ``nixl.nixl_thread_sync_t``: that name is the raw binding, and
+        # the config only takes this enum.
+        from nixl._api import nixl_thread_sync_t  # noqa: PLC0415
+
         if num_slots < 1:
             raise ValueError("num_slots must be positive")
         self.num_slots = num_slots
@@ -152,8 +166,16 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         on_gpu = self.device.type == "cuda" and not self._host_staging
         self._mem_type = "VRAM" if on_gpu else "DRAM"
         self._device_id = (self.device.index or 0) if on_gpu else 0
+        self._progress_thread = _PROGRESS_THREAD
         self.agent = nixl_agent(
-            _agent_name(self.rank), nixl_agent_config(backends=[NIXL_BACKEND])
+            _agent_name(self.rank),
+            nixl_agent_config(
+                backends=[NIXL_BACKEND],
+                enable_prog_thread=self._progress_thread,
+                sync_mode=None
+                if self._progress_thread
+                else nixl_thread_sync_t.NIXL_THREAD_SYNC_RW,
+            ),
         )
         # (kind, tail, dtype) -> local region of num_slots * world_size * R
         # rows, and the gather buffer of the same size that dispatch returns
@@ -259,6 +281,12 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         """Whether the NIXL regions are pinned host memory (see the module
         docstring)."""
         return self._host_staging
+
+    @property
+    def progress_thread(self) -> bool:
+        """Whether the NIXL agent runs its progress thread (see the module
+        docstring)."""
+        return self._progress_thread
 
     def _slot_rows(self, slot: int) -> slice:
         """Rows of ``slot`` in a region / send / gather buffer."""
