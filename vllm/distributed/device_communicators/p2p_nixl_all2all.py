@@ -77,6 +77,7 @@ cannot import the plugin. Limitation: unquantized rows only (no fp8 wire).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -112,11 +113,25 @@ def _agent_name(rank: int) -> str:
     return f"p2p-nixl-{rank}"
 
 
+def _profiling() -> bool:
+    """Whether a profiler is recording. A ``record_function`` range costs
+    several microseconds of host time even when none is, so the ranges of
+    this module are opened only while one records."""
+    return torch.autograd.profiler._is_profiler_enabled
+
+
+def _profile_range(name: str) -> contextlib.AbstractContextManager:
+    """``record_function(name)`` while a profiler records, else nothing."""
+    if _profiling():
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
+
+
 def _mark(name: str) -> None:
-    """A point in time in profiler traces: a range of zero length (only the
-    range bookkeeping when the profiler is off)."""
-    with torch.profiler.record_function(name):
-        pass
+    """A point in time in profiler traces: a range of zero length."""
+    if _profiling():
+        with torch.profiler.record_function(name):
+            pass
 
 
 @dataclass(frozen=True)
@@ -313,7 +328,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # sync; poll for the plan kernels instead so the posted WRITEs are
         # serviced (their notifications only go out when their state is
         # checked) meanwhile. The receive counts arrive with the rows.
-        with torch.profiler.record_function("p2p_nixl.plan_wait"):
+        with _profile_range("p2p_nixl.plan_wait"):
             self._wait_until(self._stream_done(), "plan")
         return self.finish_plan_local(pending)
 
@@ -575,7 +590,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             outputs.append(self._gathers[key][self._slot_rows(slot)][:rows])
         # One WRITE per peer carrying hidden, ids and weights, so one
         # notification per peer announces the whole share.
-        with torch.profiler.record_function(f"p2p_nixl.dispatch_post[{slot}]"):
+        with _profile_range(f"p2p_nixl.dispatch_post[{slot}]"):
             self._post(slot, "d", packed, plan.send_counts, notif)
         self._pending[(slot, "d")] = _PendingReceive(
             notif=notif + b":", keys=keys, plan=plan
@@ -585,7 +600,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     def dispatch_wait(self, plan: P2pAll2AllPlan) -> None:
         """Wait for the rows of ``plan``'s dispatch; the views ``dispatch``
         returned hold them afterwards (gathered on the current stream)."""
-        with torch.profiler.record_function(f"p2p_nixl.dispatch_wait[{plan.slot}]"):
+        with _profile_range(f"p2p_nixl.dispatch_wait[{plan.slot}]"):
             self._receive(plan.slot, "d")
 
     def combine_send(self, plan: P2pAll2AllPlan, partial: torch.Tensor) -> torch.Tensor:
@@ -610,7 +625,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # the stream before the WRITE.
         staged.copy_(partial, non_blocking=True)
         notif = f"c{plan.seq}".encode()
-        with torch.profiler.record_function(f"p2p_nixl.combine_post[{slot}]"):
+        with _profile_range(f"p2p_nixl.combine_post[{slot}]"):
             self._post(slot, "c", [(key, staged)], plan.recv_counts, notif)
         self._pending[(slot, "c")] = _PendingReceive(
             notif=notif, keys=[key], recv_counts=plan.send_counts
@@ -622,7 +637,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     ) -> torch.Tensor:
         """Wait for the partial sums of ``plan``'s combine, then sum them into
         ``out`` as the NCCL engine does."""
-        with torch.profiler.record_function(f"p2p_nixl.combine_wait[{plan.slot}]"):
+        with _profile_range(f"p2p_nixl.combine_wait[{plan.slot}]"):
             self._receive(plan.slot, "c")
         return super().combine_accumulate(plan, back, out)
 
