@@ -1128,15 +1128,12 @@ class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
             logger.info_once(
                 "p2p_nixl all2all: world_size=%d, %d local experts, "
                 "buffer capacity %d rows per tensor, regions %d rows x %d "
-                "micro-batch slots, backend UCX, host staging %s, progress "
-                "thread %s.",
+                "micro-batch slots, backend UCX.",
                 self.world_size,
                 num_local_experts,
                 self._engine.capacity,
                 self.world_size * max_tokens_per_rank,
                 num_slots,
-                self._engine.host_staging,
-                self._engine.progress_thread,
             )
             return self._engine
         return super().get_handle(kwargs)
