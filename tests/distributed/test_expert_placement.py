@@ -504,13 +504,27 @@ def test_placement_file_config_reads_no_file():
     [
         {"expert_placement_counts": [48, 16]},
         {"expert_placement_strategy": "round_robin"},
-        {"all2all_backend": "p2p_nccl"},
         {"enable_ep_weight_filter": True},
     ],
 )
 def test_placement_file_config_rejects_unsupported(overrides):
     with pytest.raises(ValueError):
         ParallelConfig(expert_placement_file="placement.json", **overrides)
+
+
+def test_placement_file_backend_is_checked_per_layer(tmp_path):
+    """AFD with microbatching validates the config under a temporary all2all
+    backend, so the backend is checked where a MoE layer reads the file."""
+    ParallelConfig(
+        expert_placement_file="placement.json", all2all_backend="deepep_low_latency"
+    )
+    path = write_placement(tmp_path, {"1": [[0, 1], [2, 3]]})
+    name = "model.layers.1.mlp.experts"
+    for backend in ("p2p_nccl", "deepep_low_latency"):
+        with pytest.raises(ValueError, match="all2all backends"):
+            expert_placement_for_layer(path, name, 0, 2, 4, backend)
+    for backend in ("allgather_reducescatter", "prerouted"):
+        assert expert_placement_for_layer(path, name, 0, 2, 4, backend) == [0, 1]
 
 
 def test_p2p_engine_routes_by_per_call_owner():

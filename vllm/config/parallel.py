@@ -576,11 +576,9 @@ class ParallelConfig:
                     "expert_placement_file does not support EPLB, elastic EP or "
                     "enable_ep_weight_filter."
                 )
-            if self.all2all_backend not in ("allgather_reducescatter", "prerouted"):
-                raise ValueError(
-                    "expert_placement_file supports the allgather_reducescatter "
-                    f"and prerouted all2all backends, got {self.all2all_backend!r}."
-                )
+            # The all2all backend is checked where each MoE layer reads the
+            # file (expert_placement_for_layer): AFD with microbatching (DBO)
+            # validates this config under a temporary all2all backend.
 
         tp = self.tensor_parallel_size
         pcp = self.prefill_context_parallel_size
