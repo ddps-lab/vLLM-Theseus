@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
+    expert_placement_for_layer,  # [theseus expert placement]
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
@@ -271,6 +272,24 @@ def FusedMoE(
             f"got {moe_backend!r}."
         )
 
+    # [theseus expert placement] This layer's experts on this EP rank, from the
+    # placement file; non-contiguous lists need the same Triton kernel.
+    placement_file = vllm_config.parallel_config.expert_placement_file
+    placement_experts = None
+    if placement_file is not None and moe_parallel_config.use_ep:
+        if moe_backend != "triton":
+            raise ValueError(
+                "expert_placement_file requires --moe-backend triton, "
+                f"got {moe_backend!r}."
+            )
+        placement_experts = expert_placement_for_layer(
+            placement_file,
+            layer_name,
+            moe_parallel_config.ep_rank,
+            moe_parallel_config.ep_size,
+            global_num_experts,
+        )
+
     # Create ExpertMapManager to handle expert mapping and placement for EP.
     # See ExpertMapManager for a detailed description of what it does and when
     # it is required.
@@ -286,6 +305,7 @@ def FusedMoE(
         num_fused_shared_experts=num_fused_shared_experts,
         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
         placement_counts=placement_counts,
+        placement_experts=placement_experts,  # [theseus expert placement]
     )
 
     # TODO(bnell): we should not have to create a router if the kernel is

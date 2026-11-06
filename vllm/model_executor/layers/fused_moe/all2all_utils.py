@@ -370,8 +370,11 @@ def maybe_make_prepare_finalize(
         placement_counts = (
             get_current_vllm_config().parallel_config.expert_placement_counts
         )
+        # [theseus expert placement] so are the lists of a placement file.
+        placement_file = get_current_vllm_config().parallel_config.expert_placement_file
         if (
             placement_counts is None
+            and placement_file is None
             and moe.num_experts % moe.moe_parallel_config.ep_size != 0
         ):
             raise NotImplementedError(
@@ -379,7 +382,7 @@ def maybe_make_prepare_finalize(
                 "id // num_local_experts, which needs num_experts "
                 f"({moe.num_experts}) divisible by ep_size "
                 f"({moe.moe_parallel_config.ep_size}) unless "
-                "expert_placement_counts is set."
+                "expert_placement_counts or expert_placement_file is set."
             )
         if moe.moe_parallel_config.is_sequence_parallel:
             raise NotImplementedError(

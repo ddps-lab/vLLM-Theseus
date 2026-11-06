@@ -191,6 +191,14 @@ class ParallelConfig:
     "linear" strategy. For example, `48 16` places experts [0, 48) on rank 0
     and [48, 64) on rank 1. Unset distributes them evenly. Uneven counts need a
     MoE kernel that follows `expert_map` (`--moe-backend triton`)."""
+    expert_placement_file: str | None = None  # [theseus expert placement]
+    """JSON file with the routed experts of every EP rank, per MoE layer, for
+    the "linear" strategy: `{"format": "theseus-expert-placement-v1",
+    "num_experts": E, "num_ranks": R, "layers": {"<layer index>": [[experts
+    of rank 0], ..., [experts of rank R-1]]}}`. Every MoE layer is listed; the
+    position in a rank's list is the local expert id and an expert may be on
+    several ranks. Needs a MoE kernel that follows `expert_map`
+    (`--moe-backend triton`)."""
     all2all_backend: All2AllBackend = "allgather_reducescatter"
     """All2All backend for MoE expert parallel communication. Available options:
 
@@ -544,6 +552,33 @@ class ParallelConfig:
             if self.all2all_backend not in ("allgather_reducescatter", "prerouted"):
                 raise ValueError(
                     "expert_placement_counts supports the allgather_reducescatter "
+                    f"and prerouted all2all backends, got {self.all2all_backend!r}."
+                )
+
+        # [theseus expert placement] The file is read per MoE layer
+        # (expert_placement_for_layer), where the layer and EP size are known.
+        if self.expert_placement_file is not None:
+            if counts is not None:
+                raise ValueError(
+                    "expert_placement_file and expert_placement_counts cannot "
+                    "be used together."
+                )
+            if self.expert_placement_strategy != "linear":
+                raise ValueError(
+                    "expert_placement_file requires the linear placement strategy."
+                )
+            if (
+                self.enable_eplb
+                or self.enable_elastic_ep
+                or self.enable_ep_weight_filter
+            ):
+                raise ValueError(
+                    "expert_placement_file does not support EPLB, elastic EP or "
+                    "enable_ep_weight_filter."
+                )
+            if self.all2all_backend not in ("allgather_reducescatter", "prerouted"):
+                raise ValueError(
+                    "expert_placement_file supports the allgather_reducescatter "
                     f"and prerouted all2all backends, got {self.all2all_backend!r}."
                 )
 
