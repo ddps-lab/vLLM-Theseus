@@ -401,10 +401,10 @@ def test_placement_file_round_trip(tmp_path):
         layers={5: ((3, 0), (1, 2)), 7: ((0, 1, 2), (3,))},
     )
     rank0_layer5 = expert_placement_for_layer(
-        path, "model.layers.5.mlp.experts", 0, 2, 4
+        path, "model.layers.5.mlp.experts", 0, 2, 4, "allgather_reducescatter"
     )
     rank1_layer7 = expert_placement_for_layer(
-        path, "model.layers.7.mlp.experts", 1, 2, 4
+        path, "model.layers.7.mlp.experts", 1, 2, 4, "allgather_reducescatter"
     )
     assert rank0_layer5 == [3, 0]
     assert rank1_layer7 == [3]
@@ -419,12 +419,41 @@ def test_placement_file_allows_copies(tmp_path):
             rank,
             4,
             expert_placement_experts=expert_placement_for_layer(
-                path, "model.layers.1.mlp.experts", rank, 2, 4
+                path, "model.layers.1.mlp.experts", rank, 2, 4, "prerouted"
             ),
         )[1].tolist()
         for rank in range(2)
     ]
     assert maps == [[0, 1, 2, -1], [-1, -1, 0, 1]]
+
+
+def test_placement_has_copies():
+    placement = ExpertPlacement(
+        num_experts=4, num_ranks=2, layers={1: ((0, 1, 2), (2, 3)), 2: ((0, 1), (2, 3))}
+    )
+    assert placement.has_copies(1)
+    assert not placement.has_copies(2)
+
+
+@pytest.mark.parametrize(
+    ("backend", "layers", "ok"),
+    [
+        ("allgather_reducescatter", {"1": [[0, 1, 2], [2, 3]]}, False),
+        ("prerouted", {"1": [[0, 1, 2], [2, 3]]}, True),
+        ("allgather_reducescatter", {"1": [[0, 1], [2, 3]]}, True),
+    ],
+)
+def test_placement_copies_need_prerouted(tmp_path, backend, layers, ok):
+    """Only the sender of prerouted tokens can pick one copy per token; with
+    another backend every copy would compute it and the sum count it twice."""
+    path = write_placement(tmp_path, layers)
+    name = "model.layers.1.mlp.experts"
+    if ok:
+        experts = expert_placement_for_layer(path, name, 0, 2, 4, backend)
+        assert experts == layers["1"][0]
+    else:
+        with pytest.raises(ValueError, match="prerouted"):
+            expert_placement_for_layer(path, name, 0, 2, 4, backend)
 
 
 @pytest.mark.parametrize(
@@ -460,7 +489,9 @@ def test_placement_file_mismatch_raises(
     """Missing layer, other EP size or other expert count."""
     path = write_placement(tmp_path, {"1": [[0, 1], [2, 3]]})
     with pytest.raises(ValueError):
-        expert_placement_for_layer(path, layer_name, 0, ep_size, global_num_experts)
+        expert_placement_for_layer(
+            path, layer_name, 0, ep_size, global_num_experts, "prerouted"
+        )
 
 
 def test_placement_file_config_reads_no_file():
@@ -525,3 +556,65 @@ def test_p2p_engine_default_owner_table_matches_default(expert_counts):
     explicit = engine.begin_plan(topk_ids, expert_owner=owner)
     assert torch.equal(engine._count_buf(0)[0], default_counts)
     assert torch.equal(explicit.order, default.order)
+
+
+def make_rank_of_engine():
+    # Two expert ranks owning experts [0, 3) and [3, 4), one rank without.
+    return P2pAll2AllEngine(
+        group=None,
+        rank=2,
+        world_size=3,
+        num_local_experts=2,
+        max_tokens_per_rank=4,
+        device="cpu",
+        expert_counts=[3, 1],
+    )
+
+
+def test_p2p_engine_routes_by_per_pair_ranks():
+    """Each (token, expert) pair goes where rank_of says, not to the owner."""
+    engine = make_rank_of_engine()
+    topk_ids = torch.tensor([[0, 3], [3, 1], [1, 2], [-1, -1]])
+    # Token 0: both experts on rank 1 (one visit); token 1: expert 3's copy on
+    # rank 0, expert 1 nowhere; token 2: both ranks; token 3: padding.
+    rank_of = torch.tensor([[1, 1], [0, -1], [1, 0], [-1, -1]])
+    pending = engine.begin_plan(topk_ids, rank_of=rank_of)
+    assert engine._count_buf(0)[0].tolist() == [2, 2, 0]
+    # Destination-major order of rank * 4 + token: rank 0 gets tokens 1, 2,
+    # rank 1 tokens 0, 2; the rest is padding (3 * 4).
+    assert pending.order[:4].tolist() == [1, 2, 4, 6]
+    assert (pending.order[4:] == 12).all()
+
+
+def test_p2p_engine_per_pair_ranks_match_owner_table():
+    """rank_of read from an expert -> rank table gives that table's plan."""
+    engine = P2pAll2AllEngine(
+        group=None,
+        rank=4,
+        world_size=5,
+        num_local_experts=16,
+        max_tokens_per_rank=32,
+        device="cpu",
+    )
+    generator = torch.Generator().manual_seed(0)
+    topk_ids = torch.randint(-1, 64, (32, 6), generator=generator)
+    owner = torch.randint(0, 4, (64,), generator=generator)
+    rank_of = torch.where(topk_ids >= 0, owner[topk_ids.clamp(min=0)], -1)
+    by_owner = engine.begin_plan(topk_ids, expert_owner=owner)
+    owner_counts = engine._count_buf(0)[0].clone()
+    by_pair = engine.begin_plan(topk_ids, rank_of=rank_of)
+    assert torch.equal(engine._count_buf(0)[0], owner_counts)
+    assert torch.equal(by_pair.order, by_owner.order)
+
+
+@pytest.mark.parametrize(
+    ("rank_of_shape", "with_owner"), [((4, 2), True), ((4,), False), ((4, 1), False)]
+)
+def test_p2p_engine_rejects_bad_rank_of(rank_of_shape, with_owner):
+    engine = make_rank_of_engine()
+    topk_ids = torch.tensor([[0, 3], [3, 1], [1, 2], [-1, -1]])
+    owner = torch.tensor([1, 0, 0, 1]) if with_owner else None
+    with pytest.raises(ValueError):
+        engine.begin_plan(
+            topk_ids, expert_owner=owner, rank_of=torch.zeros(rank_of_shape).long()
+        )

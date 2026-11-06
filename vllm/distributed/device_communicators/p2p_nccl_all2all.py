@@ -211,6 +211,7 @@ class P2pAll2AllEngine:
         topk_ids: torch.Tensor,
         slot: int = 0,
         expert_owner: torch.Tensor | None = None,  # [theseus expert placement]
+        rank_of: torch.Tensor | None = None,  # [theseus expert placement]
     ) -> P2pAll2AllPendingPlan:
         """Device-only part of the plan: destinations, send counts, ordering.
 
@@ -218,7 +219,23 @@ class P2pAll2AllEngine:
         gives the rank every global expert is sent to for this call only
         (e.g. the current layer's placement); it overrides the engine's own
         table or ``id // num_local_experts``.
+
+        ``rank_of`` (int64, shaped like ``topk_ids``, on the engine device)
+        gives the rank of every (token, selected expert) pair directly, -1
+        for none (e.g. padding), so the sender picks which copy of an expert
+        placed on several ranks computes the token; it overrides the engine's
+        table and cannot be combined with ``expert_owner``. Either way a
+        token visits each rank at most once.
         """
+        # [theseus expert placement]
+        if rank_of is not None:
+            if expert_owner is not None:
+                raise ValueError("begin_plan takes expert_owner or rank_of, not both.")
+            if rank_of.shape != topk_ids.shape:
+                raise ValueError(
+                    f"rank_of has shape {tuple(rank_of.shape)}, topk_ids "
+                    f"{tuple(topk_ids.shape)}; they must match."
+                )
         num_tokens = topk_ids.shape[0]
         world = self.world_size
 
@@ -235,18 +252,22 @@ class P2pAll2AllEngine:
             )
         self._zero_send_slots.discard(slot)
 
-        # [theseus expert placement] a per-call table wins over the engine's.
-        if expert_owner is None:
-            expert_owner = self._expert_owner
-        if expert_owner is None:
-            # Floor division keeps padding ids (< 0) negative: no rank matches.
-            rank_of = torch.div(topk_ids, self.num_local_experts, rounding_mode="floor")
-        else:
-            # Padding ids (< 0) must not index the table from its end.
-            ids = topk_ids.long()
-            rank_of = torch.where(ids >= 0, expert_owner[ids.clamp(min=0)], -1)
+        # [theseus expert placement] per-pair ranks win over any table, a
+        # per-call table over the engine's.
+        if rank_of is None:
+            if expert_owner is None:
+                expert_owner = self._expert_owner
+            if expert_owner is None:
+                # Floor division keeps padding ids (< 0) negative: no rank matches.
+                rank_of = torch.div(
+                    topk_ids, self.num_local_experts, rounding_mode="floor"
+                )
+            else:
+                # Padding ids (< 0) must not index the table from its end.
+                ids = topk_ids.long()
+                rank_of = torch.where(ids >= 0, expert_owner[ids.clamp(min=0)], -1)
         # dest[r, t]: token t has to visit rank r (at most once per rank),
-        # destination-major. Negative ids (padding) match no rank.
+        # destination-major. Negative ranks (padding, none) match no rank.
         dest = (rank_of.unsqueeze(0) == self._arange_r3).any(dim=2)
         torch.sum(dest, dim=1, out=self._count_buf(slot)[0])
 

@@ -197,8 +197,8 @@ class ParallelConfig:
     "num_experts": E, "num_ranks": R, "layers": {"<layer index>": [[experts
     of rank 0], ..., [experts of rank R-1]]}}`. Every MoE layer is listed; the
     position in a rank's list is the local expert id and an expert may be on
-    several ranks. Needs a MoE kernel that follows `expert_map`
-    (`--moe-backend triton`)."""
+    several ranks (copies need the prerouted all2all backend). Needs a MoE
+    kernel that follows `expert_map` (`--moe-backend triton`)."""
     all2all_backend: All2AllBackend = "allgather_reducescatter"
     """All2All backend for MoE expert parallel communication. Available options:
 

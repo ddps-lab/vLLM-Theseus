@@ -39,6 +39,11 @@ class ExpertPlacement:
     num_ranks: int
     layers: dict[int, tuple[tuple[int, ...], ...]]
 
+    def has_copies(self, layer: int) -> bool:
+        """Whether some expert of ``layer`` is on more than one rank."""
+        ranks = self.layers[layer]
+        return sum(map(len, ranks)) > len(set().union(*ranks))
+
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -97,10 +102,16 @@ def expert_placement_for_layer(
     ep_rank: int,
     ep_size: int,
     global_num_experts: int,
+    all2all_backend: str,
 ) -> list[int]:
     """Global ids of the experts on EP rank ``ep_rank``, in local order, of
     the MoE layer ``layer_name`` (e.g. "model.layers.5.mlp.experts" is layer
-    5) in an expert placement file."""
+    5) in an expert placement file.
+
+    An expert on several ranks needs the ``prerouted`` all2all backend, where
+    the sender picks the copy that computes each token; with any other every
+    copy would compute every token and the results would be summed twice.
+    """
     # Imported here: vllm.model_executor.models imports this module.
     from vllm.model_executor.models.utils import extract_layer_index
 
@@ -115,6 +126,12 @@ def expert_placement_for_layer(
     if layer not in placement.layers:
         raise ValueError(
             f"expert placement file {path!r} has no layer {layer} ({layer_name!r})."
+        )
+    if all2all_backend != "prerouted" and placement.has_copies(layer):
+        raise ValueError(
+            f"expert placement file {path!r} puts experts of layer {layer} on "
+            "more than one EP rank; copies need the prerouted all2all backend, "
+            f"got {all2all_backend!r}."
         )
     return list(placement.layers[layer][ep_rank])
 

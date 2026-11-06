@@ -273,7 +273,8 @@ def FusedMoE(
         )
 
     # [theseus expert placement] This layer's experts on this EP rank, from the
-    # placement file; non-contiguous lists need the same Triton kernel.
+    # placement file; non-contiguous lists need the same Triton kernel and
+    # copies the prerouted backend.
     placement_file = vllm_config.parallel_config.expert_placement_file
     placement_experts = None
     if placement_file is not None and moe_parallel_config.use_ep:
@@ -288,6 +289,7 @@ def FusedMoE(
             moe_parallel_config.ep_rank,
             moe_parallel_config.ep_size,
             global_num_experts,
+            vllm_config.parallel_config.all2all_backend,
         )
 
     # Create ExpertMapManager to handle expert mapping and placement for EP.
