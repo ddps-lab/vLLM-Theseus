@@ -206,8 +206,19 @@ class P2pAll2AllEngine:
             self._count_bufs[slot] = buf
         return buf
 
-    def begin_plan(self, topk_ids: torch.Tensor, slot: int = 0) -> P2pAll2AllPendingPlan:
-        """Device-only part of the plan: destinations, send counts, ordering."""
+    def begin_plan(
+        self,
+        topk_ids: torch.Tensor,
+        slot: int = 0,
+        expert_owner: torch.Tensor | None = None,  # [theseus expert placement]
+    ) -> P2pAll2AllPendingPlan:
+        """Device-only part of the plan: destinations, send counts, ordering.
+
+        ``expert_owner`` (int64, ``[num_experts]``, on the engine device)
+        gives the rank every global expert is sent to for this call only
+        (e.g. the current layer's placement); it overrides the engine's own
+        table or ``id // num_local_experts``.
+        """
         num_tokens = topk_ids.shape[0]
         world = self.world_size
 
@@ -224,13 +235,16 @@ class P2pAll2AllEngine:
             )
         self._zero_send_slots.discard(slot)
 
-        if self._expert_owner is None:
+        # [theseus expert placement] a per-call table wins over the engine's.
+        if expert_owner is None:
+            expert_owner = self._expert_owner
+        if expert_owner is None:
             # Floor division keeps padding ids (< 0) negative: no rank matches.
             rank_of = torch.div(topk_ids, self.num_local_experts, rounding_mode="floor")
         else:
             # Padding ids (< 0) must not index the table from its end.
             ids = topk_ids.long()
-            rank_of = torch.where(ids >= 0, self._expert_owner[ids.clamp(min=0)], -1)
+            rank_of = torch.where(ids >= 0, expert_owner[ids.clamp(min=0)], -1)
         # dest[r, t]: token t has to visit rank r (at most once per rank),
         # destination-major. Negative ids (padding) match no rank.
         dest = (rank_of.unsqueeze(0) == self._arange_r3).any(dim=2)

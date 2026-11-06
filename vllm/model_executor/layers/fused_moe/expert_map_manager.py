@@ -7,6 +7,11 @@ This module contains the ExpertMapManager class which manages expert ID
 mappings and placement strategies for Expert Parallelism in MoE models.
 """
 
+import functools
+import json
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 import torch
 
 from vllm.config.parallel import ExpertPlacementStrategy
@@ -18,6 +23,101 @@ from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
 
 logger = init_logger(__name__)
 
+# [theseus expert placement]
+EXPERT_PLACEMENT_FORMAT = "theseus-expert-placement-v1"
+
+
+@dataclass(frozen=True)
+class ExpertPlacement:
+    """Contents of an expert placement file (`--expert-placement-file`).
+
+    ``layers[i][r]`` lists the global expert ids on EP rank ``r`` in decoder
+    layer ``i``, in local order. An expert may be on several ranks.
+    """
+
+    num_experts: int
+    num_ranks: int
+    layers: dict[int, tuple[tuple[int, ...], ...]]
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@functools.lru_cache
+def load_expert_placement(path: str) -> ExpertPlacement:
+    """Read and validate an expert placement file (once per process)."""
+    with open(path) as f:
+        data = json.load(f)
+    where = f"expert placement file {path!r}"
+    if not isinstance(data, dict) or data.get("format") != EXPERT_PLACEMENT_FORMAT:
+        raise ValueError(f"{where}: format must be {EXPERT_PLACEMENT_FORMAT!r}.")
+    num_experts = data.get("num_experts")
+    num_ranks = data.get("num_ranks")
+    for name, value in (("num_experts", num_experts), ("num_ranks", num_ranks)):
+        if not _is_int(value) or value < 1:
+            raise ValueError(f"{where}: {name} must be a positive integer.")
+    raw_layers = data.get("layers")
+    if not isinstance(raw_layers, dict) or not raw_layers:
+        raise ValueError(f"{where}: layers must map layer indices to rank lists.")
+
+    layers: dict[int, tuple[tuple[int, ...], ...]] = {}
+    for key, ranks in raw_layers.items():
+        if not key.isdigit() or int(key) in layers:
+            raise ValueError(f"{where}: bad or repeated layer index {key!r}.")
+        if not isinstance(ranks, list) or len(ranks) != num_ranks:
+            raise ValueError(f"{where}: layer {key} must have {num_ranks} rank lists.")
+        placed: set[int] = set()
+        for rank, experts in enumerate(ranks):
+            if not isinstance(experts, list) or not experts:
+                raise ValueError(
+                    f"{where}: layer {key} rank {rank} must list at least one expert."
+                )
+            if not all(_is_int(e) and 0 <= e < num_experts for e in experts):
+                raise ValueError(
+                    f"{where}: layer {key} rank {rank} has expert ids outside "
+                    f"[0, {num_experts}): {experts}."
+                )
+            if len(set(experts)) != len(experts):
+                raise ValueError(
+                    f"{where}: layer {key} rank {rank} lists an expert twice: "
+                    f"{experts}."
+                )
+            placed.update(experts)
+        missing = sorted(set(range(num_experts)) - placed)
+        if missing:
+            raise ValueError(f"{where}: layer {key} has no rank for {missing}.")
+        layers[int(key)] = tuple(tuple(experts) for experts in ranks)
+    return ExpertPlacement(num_experts, num_ranks, layers)
+
+
+def expert_placement_for_layer(
+    path: str,
+    layer_name: str,
+    ep_rank: int,
+    ep_size: int,
+    global_num_experts: int,
+) -> list[int]:
+    """Global ids of the experts on EP rank ``ep_rank``, in local order, of
+    the MoE layer ``layer_name`` (e.g. "model.layers.5.mlp.experts" is layer
+    5) in an expert placement file."""
+    # Imported here: vllm.model_executor.models imports this module.
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    placement = load_expert_placement(path)
+    if placement.num_ranks != ep_size or placement.num_experts != global_num_experts:
+        raise ValueError(
+            f"expert placement file {path!r} places {placement.num_experts} "
+            f"experts on {placement.num_ranks} EP ranks, but {layer_name!r} has "
+            f"{global_num_experts} experts on {ep_size} EP ranks."
+        )
+    layer = extract_layer_index(layer_name)
+    if layer not in placement.layers:
+        raise ValueError(
+            f"expert placement file {path!r} has no layer {layer} ({layer_name!r})."
+        )
+    return list(placement.layers[layer][ep_rank])
+
 
 def determine_expert_map(
     ep_size: int,
@@ -27,12 +127,15 @@ def determine_expert_map(
     num_fused_shared_experts: int = 0,
     return_expert_mask: bool = False,
     expert_placement_counts: list[int] | None = None,  # [theseus expert counts]
+    # [theseus expert placement]
+    expert_placement_experts: Sequence[int] | None = None,
 ) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
     """
     Calculates how many experts should be assigned to each rank for EP and
     creates a mapping from global to local expert index. Experts are
     distributed evenly across ranks, the remainder going to the first ranks,
-    unless expert_placement_counts gives the count of every rank.
+    unless expert_placement_counts gives the count of every rank or
+    expert_placement_experts lists the experts of this rank.
 
     Args:
         ep_size: The size of the expert parallel group
@@ -44,6 +147,9 @@ def determine_expert_map(
         return_expert_mask: Whether to return expert mask for AITER
         expert_placement_counts: Number of experts on each rank, in rank
             order (linear placement only).
+        expert_placement_experts: Global ids of the experts on this rank, in
+            local order (linear placement only, without
+            expert_placement_counts).
 
     Returns:
         tuple[int, Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple containing:
@@ -66,6 +172,24 @@ def determine_expert_map(
     if ep_size == 1:
         return (global_num_experts, None, None)
 
+    # [theseus expert placement] this rank's experts replace the linear block.
+    if expert_placement_experts is not None:
+        local_experts = list(expert_placement_experts)
+        if expert_placement_strategy != "linear" or expert_placement_counts is not None:
+            raise ValueError(
+                "expert_placement_experts requires linear placement without "
+                "expert_placement_counts."
+            )
+        if (
+            not local_experts
+            or len(set(local_experts)) != len(local_experts)
+            or not all(0 <= e < global_num_experts for e in local_experts)
+        ):
+            raise ValueError(
+                f"expert_placement_experts {local_experts} must list distinct "
+                f"expert ids in [0, {global_num_experts})."
+            )
+
     # [theseus expert counts] per-rank counts; the even split is one such list.
     if expert_placement_counts is None:
         # Distribute experts as evenly as possible to each rank.
@@ -87,7 +211,12 @@ def determine_expert_map(
     expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
 
     # Create an expert map for the local experts
-    if expert_placement_strategy == "linear":
+    if expert_placement_experts is not None:  # [theseus expert placement]
+        local_num_experts = len(local_experts)
+        expert_map[torch.tensor(local_experts, dtype=torch.long)] = torch.arange(
+            0, local_num_experts, dtype=torch.int32
+        )
+    elif expert_placement_strategy == "linear":
         start_idx = sum(counts[:ep_rank])
         expert_map[start_idx : start_idx + local_num_experts] = torch.arange(
             0, local_num_experts, dtype=torch.int32
@@ -208,6 +337,7 @@ class ExpertMapManager:
         num_fused_shared_experts: int = 0,
         rocm_aiter_enabled: bool = False,
         placement_counts: list[int] | None = None,  # [theseus expert counts]
+        placement_experts: list[int] | None = None,  # [theseus expert placement]
     ):
         """
         Initialize expert map manager.
@@ -221,9 +351,12 @@ class ExpertMapManager:
             rocm_aiter_enabled: Whether ROCm AITER fusion is enabled
             placement_counts: Number of experts on each EP rank (linear
                 placement); None distributes them evenly
+            placement_experts: Global ids of the experts on this EP rank, in
+                local order (linear placement); overrides the even split
         """
         self.global_num_experts = global_num_experts
         self.placement_counts = placement_counts
+        self.placement_experts = placement_experts  # [theseus expert placement]
         self.moe_parallel_config = moe_parallel_config
         self.num_fused_shared_experts = num_fused_shared_experts
         self.rocm_aiter_enabled = rocm_aiter_enabled
@@ -470,6 +603,8 @@ class ExpertMapManager:
             num_fused_shared_experts=self.num_fused_shared_experts,
             return_expert_mask=self.rocm_aiter_enabled,
             expert_placement_counts=self.placement_counts,
+            # [theseus expert placement]
+            expert_placement_experts=self.placement_experts,
         )
 
         self._local_num_experts += self.num_fused_shared_experts
