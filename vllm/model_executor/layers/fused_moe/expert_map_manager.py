@@ -96,6 +96,10 @@ def load_expert_placement(path: str) -> ExpertPlacement:
     return ExpertPlacement(num_experts, num_ranks, layers)
 
 
+# The all2all backends that build their dispatch from an expert placement file.
+EXPERT_PLACEMENT_FILE_BACKENDS = ("allgather_reducescatter", "prerouted")
+
+
 def expert_placement_for_layer(
     path: str,
     layer_name: str,
@@ -121,6 +125,12 @@ def expert_placement_for_layer(
             f"expert placement file {path!r} places {placement.num_experts} "
             f"experts on {placement.num_ranks} EP ranks, but {layer_name!r} has "
             f"{global_num_experts} experts on {ep_size} EP ranks."
+        )
+    if all2all_backend not in EXPERT_PLACEMENT_FILE_BACKENDS:
+        raise ValueError(
+            f"expert placement file {path!r} supports the "
+            f"{' and '.join(EXPERT_PLACEMENT_FILE_BACKENDS)} all2all backends, "
+            f"got {all2all_backend!r}."
         )
     layer = extract_layer_index(layer_name)
     if layer not in placement.layers:
