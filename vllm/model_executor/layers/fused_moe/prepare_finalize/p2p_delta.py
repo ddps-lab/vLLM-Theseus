@@ -410,7 +410,7 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
                 f"p2p_delta: h' {tuple(src.shape)} {src.dtype} does not match "
                 f"the MoE input {tuple(a1.shape)} {a1.dtype}"
             )
-        pending = engine.begin_plan(topk_ids, slot)
+        pending = engine.begin_plan(topk_ids, slot, expert_owner=self.expert_owner)
         # As for the plain path's deferred-receive engines: no yield before
         # the plan wait, the receiver waits after the modular kernel's yield.
         dbo_switch_to_comm_sync()

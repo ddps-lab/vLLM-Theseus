@@ -12,6 +12,7 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     EXPERT_PLACEMENT_FORMAT,
     ExpertPlacement,
     determine_expert_map,
+    expert_owner_for_layer,
     expert_placement_for_layer,
     load_expert_placement,
 )
@@ -441,6 +442,8 @@ def test_placement_has_copies():
         ("allgather_reducescatter", {"1": [[0, 1, 2], [2, 3]]}, False),
         ("prerouted", {"1": [[0, 1, 2], [2, 3]]}, True),
         ("allgather_reducescatter", {"1": [[0, 1], [2, 3]]}, True),
+        ("p2p_nixl", {"1": [[0, 1, 2], [2, 3]]}, False),
+        ("p2p_nixl", {"1": [[0, 3], [1, 2]]}, True),
     ],
 )
 def test_placement_copies_need_prerouted(tmp_path, backend, layers, ok):
@@ -520,11 +523,20 @@ def test_placement_file_backend_is_checked_per_layer(tmp_path):
     )
     path = write_placement(tmp_path, {"1": [[0, 1], [2, 3]]})
     name = "model.layers.1.mlp.experts"
-    for backend in ("p2p_nccl", "deepep_low_latency"):
-        with pytest.raises(ValueError, match="all2all backends"):
-            expert_placement_for_layer(path, name, 0, 2, 4, backend)
-    for backend in ("allgather_reducescatter", "prerouted"):
+    with pytest.raises(ValueError, match="all2all backends"):
+        expert_placement_for_layer(path, name, 0, 2, 4, "deepep_low_latency")
+    for backend in ("allgather_reducescatter", "prerouted", "p2p_nccl", "p2p_nixl"):
         assert expert_placement_for_layer(path, name, 0, 2, 4, backend) == [0, 1]
+
+
+def test_expert_owner_for_layer(tmp_path):
+    """The p2p backends route a layer by its expert -> rank table; a layer
+    with copies has no single rank per expert."""
+    path = write_placement(tmp_path, {"1": [[3, 0], [1, 2]], "2": [[0, 1, 2], [2, 3]]})
+    owner = expert_owner_for_layer(path, "model.layers.1.mlp.experts")
+    assert owner.dtype == torch.int64 and owner.tolist() == [0, 1, 1, 0]
+    with pytest.raises(ValueError, match="more than one EP rank"):
+        expert_owner_for_layer(path, "model.layers.2.mlp.experts")
 
 
 def test_p2p_engine_routes_by_per_call_owner():

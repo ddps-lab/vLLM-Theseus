@@ -173,15 +173,24 @@ class FusedAddNorm(torch.nn.Module):
         return x, residual
 
 
-def experts(rank, world, x, ids, weights, coef):
-    """Rank ``rank``'s experts on the rows ``x`` (expert ``e`` scales by
-    ``coef[e]``), reduced over the top-k in fp32, in bf16. Row by row, so a
-    row's result does not depend on its position."""
-    local = NUM_EXPERTS // world
+def owner_table(world, tables=None, layer=None):
+    """The expert -> rank table of a layer: ``tables[layer]``, or the default
+    contiguous one (expert id // experts per rank)."""
+    if tables is not None:
+        return tables[layer]
+    return torch.arange(NUM_EXPERTS) // (NUM_EXPERTS // world)
+
+
+def experts(rank, world, x, ids, weights, coef, owner=None):
+    """Rank ``rank``'s experts (``owner``: the expert -> rank table, default
+    contiguous) on the rows ``x`` (expert ``e`` scales by ``coef[e]``),
+    reduced over the top-k in fp32, in bf16. Row by row, so a row's result
+    does not depend on its position."""
+    owner = owner_table(world) if owner is None else owner
     acc = torch.zeros(x.shape, dtype=torch.float32)
     for k in range(ids.shape[1]):
         e = ids[:, k].long()
-        mine = (e >= rank * local) & (e < (rank + 1) * local)
+        mine = (e >= 0) & (owner[e.clamp(0, NUM_EXPERTS - 1)] == rank)
         c = coef[e.clamp(0, NUM_EXPERTS - 1)] * mine
         acc += (weights[:, k] * c).unsqueeze(1) * x.float()
     return acc.to(torch.bfloat16)
@@ -235,13 +244,24 @@ class Stub:
 
 
 def run(
-    monkeypatch, world, ubatches, fixed, forwards, coef, mode, scale, norm, combine=None
+    monkeypatch,
+    world,
+    ubatches,
+    fixed,
+    forwards,
+    coef,
+    mode,
+    scale,
+    norm,
+    combine=None,
+    tables=None,
 ):
     """Run every forward through one world (``mode`` "off", a delta mode or a
-    ``delta_dispatch`` mapping; ``combine`` the combine settings). Returns
-    per (forward, layer, rank, micro-batch) the output, the expert input rows
-    (x, ids, weights; the first num_recv) and the receive counts, and for
-    stateful modes both sides' states after every layer."""
+    ``delta_dispatch`` mapping; ``combine`` the combine settings; ``tables``
+    per-layer expert -> rank tables). Returns per (forward, layer, rank,
+    micro-batch) the output, the expert input rows (x, ids, weights; the
+    first num_recv) and the receive counts, and for stateful modes both
+    sides' states after every layer."""
     if mode == "off":
         engines = make_engines(monkeypatch, world, ubatches)
     else:
@@ -272,6 +292,8 @@ def run(
                 pf.bind_layer(Stub(layer, scale))
             if fixed:
                 pf._fixed_experts = types.SimpleNamespace()
+            if tables is not None:
+                pf.expert_owner = tables[layer]
             per_layer[layer] = pf
         pfs.append(per_layer)
     current = {"u": 0}
@@ -307,7 +329,8 @@ def run(
                     x_in, _, _, ids_in, w_in = receiver()
                     plan = pf._plans[u] if mode == "off" else pf._rounds[u].plan
                     n = plan.num_recv
-                    fused = experts(r, world, x_in, ids_in, w_in, coef)
+                    owner = owner_table(world, tables, layer)
+                    fused = experts(r, world, x_in, ids_in, w_in, coef, owner)
                     result = torch.empty(data[r, u][0].shape, dtype=torch.bfloat16)
                     finals[r, u] = pf.finalize_async(
                         result, fused, w_in, ids_in, False, TopKWeightAndReduceNoOP()
@@ -338,7 +361,7 @@ def run(
     return out, states
 
 
-def reference_states(world, ubatches, forwards, coef, scale):
+def reference_states(world, ubatches, forwards, coef, scale, tables=None):
     """The closed loop of ``p2p_delta.py`` computed directly: per (rank,
     micro-batch, destination, token) the state after each layer of the
     forward, for the rows the forward has visited so far (a forward starts
@@ -347,8 +370,9 @@ def reference_states(world, ubatches, forwards, coef, scale):
     for f, layers in enumerate(forwards):
         ref: dict = {}
         for layer, data in layers.items():
+            owner = owner_table(world, tables, layer)
             for (r, u), (x, h, ids, weights) in data.items():
-                owners = ids.long() // (NUM_EXPERTS // world)
+                owners = owner[ids.long()]
                 for t in range(h.shape[0]):
                     for dest in sorted(set(owners[t].tolist())):
                         if dest == r:
@@ -366,6 +390,7 @@ def reference_states(world, ubatches, forwards, coef, scale):
                             ids[t : t + 1],
                             weights[t : t + 1],
                             coef,
+                            owner,
                         )[0]
                         ref[key] = s + scale * part.float()
             states[f, layer] = dict(ref)
@@ -392,6 +417,14 @@ def test_lossless_modes_match_off(monkeypatch, world, ubatches, mode, fixed):
     delta, states = run(
         monkeypatch, world, ubatches, fixed, forwards, coef, mode, scale, norm
     )
+    assert_matches_off(off, delta)
+    if mode == "delta_fp32":
+        assert_states_follow_reference(world, ubatches, forwards, coef, scale, states)
+
+
+def assert_matches_off(off, delta):
+    """The delta world's expert inputs (own rows after the received ones) and
+    outputs equal the plain world's bit for bit."""
     for key, plain in off.items():
         got = delta[key]
         r = key[2]
@@ -403,9 +436,13 @@ def test_lossless_modes_match_off(monkeypatch, world, ubatches, mode, fixed):
             expected = torch.cat((p[:a], p[a + own :], p[a : a + own]))
             assert torch.equal(got[name], expected), (key, name)
         assert torch.equal(got["out"], plain["out"]), key
-    if mode != "delta_fp32":
-        return
-    ref = reference_states(world, ubatches, forwards, coef, scale)
+
+
+def assert_states_follow_reference(
+    world, ubatches, forwards, coef, scale, states, tables=None
+):
+    """Both sides' states equal the direct reference; own rows keep none."""
+    ref = reference_states(world, ubatches, forwards, coef, scale, tables)
     for (f, layer), per_rank in states.items():
         tokens = {key: v[1].shape[0] for key, v in forwards[f][layer].items()}
         for (r, u, dest, t), s in ref[f, layer].items():
@@ -425,7 +462,65 @@ def test_lossless_modes_match_off(monkeypatch, world, ubatches, mode, fixed):
                     assert not attn_states[u][r * n : (r + 1) * n].any()
 
 
-def visited_rows(world, forwards):
+def random_tables(world, gen):
+    """Per MoE layer a random expert -> rank table, as many experts on every
+    rank (no copies)."""
+    tables = {}
+    for layer in MOE_LAYERS:
+        owner = torch.empty(NUM_EXPERTS, dtype=torch.int64)
+        owner[torch.randperm(NUM_EXPERTS, generator=gen)] = torch.arange(
+            NUM_EXPERTS
+        ) // (NUM_EXPERTS // world)
+        tables[layer] = owner
+    return tables
+
+
+@pytest.mark.parametrize("mode", ["full_bf16", "delta_fp32"])
+@pytest.mark.parametrize("world", [2, 4])
+def test_placement_tables_route_each_layer(monkeypatch, world, mode):
+    """With per-layer expert -> rank tables a rank receives exactly the
+    tokens that pick one of its experts in that layer, and the delta path
+    still gives the plain path's inputs and outputs and reference states."""
+    ubatches = 2
+    gen = torch.Generator().manual_seed(31 + world)
+    norm = FusedAddNorm(
+        (1 + 0.1 * torch.randn(HIDDEN, generator=gen)).to(torch.bfloat16)
+    )
+    coef = 0.2 * torch.randn(NUM_EXPERTS, generator=gen)
+    tables = random_tables(world, gen)
+    forwards = make_forwards(world, ubatches, norm, gen)
+    args = (monkeypatch, world, ubatches, True, forwards, coef)
+    off, _ = run(*args, "off", 1.0, norm, tables=tables)
+    delta, states = run(*args, mode, 1.0, norm, tables=tables)
+    for (f, layer, r, u), plain in off.items():
+        for src in range(world):
+            ids = forwards[f][layer][src, u][2].long()
+            picks = (tables[layer][ids] == r).any(-1) if ids.numel() else ids
+            assert plain["recv_counts"][src] == int(picks.sum())
+    assert_matches_off(off, delta)
+    if mode == "delta_fp32":
+        assert_states_follow_reference(
+            world, ubatches, forwards, coef, 1.0, states, tables
+        )
+
+
+def test_contiguous_table_is_the_default(monkeypatch):
+    """The table expert id // experts per rank routes as no table does."""
+    world, ubatches = 4, 2
+    gen = torch.Generator().manual_seed(5)
+    norm = FusedAddNorm(
+        (1 + 0.1 * torch.randn(HIDDEN, generator=gen)).to(torch.bfloat16)
+    )
+    coef = 0.2 * torch.randn(NUM_EXPERTS, generator=gen)
+    forwards = make_forwards(world, ubatches, norm, gen)
+    tables = {layer: owner_table(world) for layer in MOE_LAYERS}
+    args = (monkeypatch, world, ubatches, True, forwards, coef)
+    plain, _ = run(*args, "off", 1.0, norm)
+    tabled, _ = run(*args, "delta_fp32", 1.0, norm, tables=tables)
+    assert_matches_off(plain, tabled)
+
+
+def visited_rows(world, forwards, tables=None):
     """Per (forward, layer): the (rank, micro-batch, destination, token) rows
     the forward has sent to another rank so far."""
     out: dict = {}
@@ -433,7 +528,7 @@ def visited_rows(world, forwards):
         seen: set = set()
         for layer, data in layers.items():
             for (r, u), (_, _, ids, _) in data.items():
-                owners = ids.long() // (NUM_EXPERTS // world)
+                owners = owner_table(world, tables, layer)[ids.long()]
                 for t in range(ids.shape[0]):
                     seen |= {(r, u, d, t) for d in set(owners[t].tolist()) if d != r}
             out[f, layer] = set(seen)

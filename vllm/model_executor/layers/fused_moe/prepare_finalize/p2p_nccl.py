@@ -196,6 +196,10 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.rank_expert_offset = rank * num_local_experts
         # One in-flight plan per micro-batch slot.
         self._plans: dict[int, P2pAll2AllPlan] = {}
+        # [theseus expert placement] this layer's expert -> rank table (int64,
+        # on the engine device) from a placement file, set by the MoE runner;
+        # None: id // num_local_experts.
+        self.expert_owner: torch.Tensor | None = None
         self._num_prepares = 0  # DEBUG(p2p_nccl)
         # Fixed-size launch (see the module docstring): rows handed to the
         # experts kernel.
@@ -291,7 +295,7 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quantize_on_receive,
             )
         self._num_prepares += 1
-        pending = self.engine.begin_plan(topk_ids, slot)
+        pending = self.engine.begin_plan(topk_ids, slot, expert_owner=self.expert_owner)
         # Under DBO: hand the CPU to the other micro-batch first, then move
         # to the communication stream and post the count exchange, whose host
         # copy blocks the CPU. Yielding first queues the other micro-batch's
@@ -368,14 +372,17 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 assert lo >= 0 and hi < self.num_experts, (
                     f"p2p_nccl: received expert ids out of range [{lo}, {hi}]"
                 )
-                is_local = (
-                    torch.div(
-                        real_ids.to(torch.int64),
-                        self.num_local_experts,
-                        rounding_mode="floor",
+                if self.expert_owner is not None:  # [theseus expert placement]
+                    is_local = self.expert_owner[real_ids.long()] == self.rank
+                else:
+                    is_local = (
+                        torch.div(
+                            real_ids.to(torch.int64),
+                            self.num_local_experts,
+                            rounding_mode="floor",
+                        )
+                        == self.rank
                     )
-                    == self.rank
-                )
                 assert bool(is_local.any(dim=1).all()), (
                     "p2p_nccl: received a token that selects none of this "
                     "rank's experts"
