@@ -22,7 +22,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
 )
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+    EXPERT_PLACEMENT_P2P_BACKENDS,  # [theseus expert placement]
     ExpertMapManager,
+    expert_owner_for_layer,  # [theseus expert placement]
     expert_placement_for_layer,  # [theseus expert placement]
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -277,6 +279,8 @@ def FusedMoE(
     # copies the prerouted backend.
     placement_file = vllm_config.parallel_config.expert_placement_file
     placement_experts = None
+    # The p2p backends route by the layer's expert -> rank table.
+    placement_owner = None
     if placement_file is not None and moe_parallel_config.use_ep:
         if moe_backend != "triton":
             raise ValueError(
@@ -291,6 +295,8 @@ def FusedMoE(
             global_num_experts,
             vllm_config.parallel_config.all2all_backend,
         )
+        if vllm_config.parallel_config.all2all_backend in EXPERT_PLACEMENT_P2P_BACKENDS:
+            placement_owner = expert_owner_for_layer(placement_file, layer_name)
 
     # Create ExpertMapManager to handle expert mapping and placement for EP.
     # See ExpertMapManager for a detailed description of what it does and when
@@ -450,6 +456,9 @@ def FusedMoE(
         else 1.0,
         **runner_args if runner_args is not None else {},
     )
+    # [theseus expert placement] handed to the p2p prepare/finalize
+    # (MoERunner._bind_p2p)
+    runner.p2p_expert_owner = placement_owner
 
     return runner
 

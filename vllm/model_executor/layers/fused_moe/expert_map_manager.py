@@ -96,8 +96,36 @@ def load_expert_placement(path: str) -> ExpertPlacement:
     return ExpertPlacement(num_experts, num_ranks, layers)
 
 
-# The all2all backends that build their dispatch from an expert placement file.
-EXPERT_PLACEMENT_FILE_BACKENDS = ("allgather_reducescatter", "prerouted")
+# The all2all backends that build their dispatch from an expert placement file
+# (the p2p ones route each layer by its table, expert_owner_for_layer).
+EXPERT_PLACEMENT_FILE_BACKENDS = (
+    "allgather_reducescatter",
+    "prerouted",
+    "p2p_nccl",
+    "p2p_nixl",
+)
+EXPERT_PLACEMENT_P2P_BACKENDS = ("p2p_nccl", "p2p_nixl")
+
+
+def expert_owner_for_layer(path: str, layer_name: str) -> torch.Tensor:
+    """The EP rank of every global expert (int64 ``[num_experts]``) of the MoE
+    layer ``layer_name`` in an expert placement file, for the dispatch plan
+    of the p2p backends. The layer must hold one copy of each expert
+    (``expert_placement_for_layer`` checks the file against the layer)."""
+    # Imported here: vllm.model_executor.models imports this module.
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    placement = load_expert_placement(path)
+    layer = extract_layer_index(layer_name)
+    if placement.has_copies(layer):
+        raise ValueError(
+            f"expert placement file {path!r} puts experts of layer {layer} on "
+            "more than one EP rank; the p2p backends route by one rank each."
+        )
+    owner = torch.empty(placement.num_experts, dtype=torch.int64)
+    for rank, experts in enumerate(placement.layers[layer]):
+        owner[list(experts)] = rank
+    return owner
 
 
 def expert_placement_for_layer(
