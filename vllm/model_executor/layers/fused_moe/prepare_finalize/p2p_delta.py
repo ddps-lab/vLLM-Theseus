@@ -53,6 +53,7 @@ from vllm.distributed.device_communicators.p2p_nixl_all2all import (
     P2pNixlAll2AllEngine,
     _profile_range,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fixed_launch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_nccl import (
@@ -71,6 +72,8 @@ from vllm.v1.worker.ubatching import (
     dbo_switch_to_compute_sync,
     dbo_yield_and_switch_from_compute_to_comm,
 )
+
+logger = init_logger(__name__)
 
 # Dual batch overlap: two micro-batches at most.
 MAX_UBATCHES = 2
@@ -315,6 +318,15 @@ def p2p_delta_rank(engine: Any, vllm_config: Any, hidden: int) -> P2pDeltaRank |
             engine.rank,
         )
         _RANKS[engine] = rank
+        # The run's record that delta dispatch is on, with which settings.
+        logger.info(
+            "p2p_delta EP rank %d/%d: %s, %s; states of %d tokens per rank",
+            engine.rank,
+            engine.world_size,
+            cfg,
+            combine,
+            engine.max_tokens_per_rank,
+        )
     return rank
 
 
