@@ -235,15 +235,17 @@ class Stub:
 
 
 def run(monkeypatch, world, ubatches, fixed, forwards, coef, mode, scale, norm):
-    """Run every forward through one world (``mode`` "off" or a delta mode).
-    Returns per (forward, layer, rank, micro-batch): the output, the expert
-    input rows (x, ids, weights; the first num_recv), the receive counts, and
-    for delta modes the rank contexts."""
+    """Run every forward through one world (``mode`` "off", a delta mode or a
+    ``delta_dispatch`` mapping). Returns per (forward, layer, rank,
+    micro-batch) the output, the expert input rows (x, ids, weights; the
+    first num_recv) and the receive counts, and for stateful modes both
+    sides' states after every layer."""
     if mode == "off":
         engines = make_engines(monkeypatch, world, ubatches)
     else:
-        cfg = DeltaDispatchConfig.from_mapping({"mode": mode})
-        settings = {"delta_row_bytes": cfg.max_row_bytes(HIDDEN), "settings": mode}
+        raw = {"mode": mode} if isinstance(mode, str) else dict(mode)
+        cfg = DeltaDispatchConfig.from_mapping(raw)
+        settings = {"delta_row_bytes": cfg.max_row_bytes(HIDDEN), "settings": repr(raw)}
         engines = make_engines(monkeypatch, world, ubatches, lambda rank: settings)
         ranks = []
         for r in range(world):
@@ -416,6 +418,82 @@ def test_lossless_modes_match_off(monkeypatch, world, ubatches, mode, fixed):
                 if f == 0:
                     n = tokens[r, u]
                     assert not attn_states[u][r * n : (r + 1) * n].any()
+
+
+def visited_rows(world, forwards):
+    """Per (forward, layer): the (rank, micro-batch, destination, token) rows
+    the forward has sent to another rank so far."""
+    out: dict = {}
+    for f, layers in enumerate(forwards):
+        seen: set = set()
+        for layer, data in layers.items():
+            for (r, u), (_, _, ids, _) in data.items():
+                owners = ids.long() // (NUM_EXPERTS // world)
+                for t in range(ids.shape[0]):
+                    seen |= {(r, u, d, t) for d in set(owners[t].tolist()) if d != r}
+            out[f, layer] = set(seen)
+    return out
+
+
+LOSSY = [
+    {"mode": "x_int8"},
+    {"mode": "x_nvfp4"},
+    {"mode": "delta_int8", "first": "int8"},
+    {"mode": "delta_nvfp4", "first": "nvfp4"},
+    # First visits in bf16: rows of two sizes in one layer.
+    {"mode": "delta_nvfp4"},
+    {"mode": "delta_nvfp4", "first": "nvfp4", "int8_layers": [1, 3]},
+    {"mode": "x_nvfp4", "int8_layers": [0, 2]},
+]
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize(
+    "settings", LOSSY, ids=lambda s: "-".join(str(v) for v in s.values())
+)
+@pytest.mark.parametrize("world", [2, 4])
+def test_lossy_modes_keep_own_rows_exact(monkeypatch, world, settings, fixed):
+    """With compressed rows a rank's own rows still reach its experts exact,
+    the routing data travels as it is, the peers' rows come close, and both
+    sides' states stay equal."""
+    ubatches = 2
+    gen = torch.Generator().manual_seed(77 + world + fixed)
+    norm = FusedAddNorm(
+        (1 + 0.1 * torch.randn(HIDDEN, generator=gen)).to(torch.bfloat16)
+    )
+    coef = 0.2 * torch.randn(NUM_EXPERTS, generator=gen)
+    forwards = make_forwards(world, ubatches, norm, gen)
+    args = (monkeypatch, world, ubatches, fixed, forwards, coef)
+    off, _ = run(*args, "off", 1.0, norm)
+    delta, states = run(*args, settings, 1.0, norm)
+    worst, changed = 0.0, 0
+    for key, plain in off.items():
+        got = delta[key]
+        r = key[2]
+        counts = plain["recv_counts"]
+        assert got["recv_counts"] == counts
+        a, own = sum(counts[:r]), counts[r]
+        num_in = sum(counts) - own
+        for name in ("ids", "weights"):
+            p = plain[name]
+            assert torch.equal(
+                got[name], torch.cat((p[:a], p[a + own :], p[a : a + own]))
+            )
+        assert torch.equal(got["x"][num_in:], plain["x"][a : a + own]), key
+        peers = torch.cat((plain["x"][:a], plain["x"][a + own :])).float()
+        if num_in:
+            err = (got["x"][:num_in].float() - peers).norm(dim=-1)
+            worst = max(worst, float((err / peers.norm(dim=-1)).max()))
+            changed += int((err > 0).sum())
+    assert 0 < worst < 0.3 and changed
+    if not DeltaDispatchConfig.from_mapping(settings).stateful:
+        return
+    for (f, layer), rows in visited_rows(world, forwards).items():
+        per_rank = states[f, layer]
+        tokens = {key: v[1].shape[0] for key, v in forwards[f][layer].items()}
+        for r, u, dest, t in rows:
+            attn = per_rank[r][0][u][dest * tokens[r, u] + t]
+            assert torch.equal(attn, per_rank[dest][1][u][r * MAX_TOKENS + t])
 
 
 def test_ranks_must_share_settings(monkeypatch):
