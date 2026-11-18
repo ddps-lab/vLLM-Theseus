@@ -18,6 +18,9 @@ their partial sums go into their dispatch place of the combine; the states
 cover the other ranks' rows only. The partial sums are summed in the
 dispatch order as in ``P2pNcclPrepareAndFinalize``, so ``full_bf16`` and
 ``delta_fp32`` give the plain path's expert inputs and outputs bit for bit.
+With combine compression (``"combine": {...}``) the peers' partial sums come
+back compressed (with error feedback, kept by the rank that computed them)
+and are rebuilt on the sending rank; the own rows' partial sums stay exact.
 
 The model registers each MoE layer's norm and records ``h'`` per
 micro-batch (``P2pDeltaLayers``, ``deepseek_v2.py``); the MoE runner binds
@@ -82,10 +85,6 @@ def p2p_delta_configs(vllm_config: Any) -> tuple[DeltaDispatchConfig, CombineCon
         raise ValueError("p2p_delta: combine compression needs delta dispatch")
     if not cfg.enabled:
         return cfg, combine
-    if combine.enabled:
-        raise NotImplementedError(
-            "p2p_delta: combine compression is not implemented yet"
-        )
     parallel = vllm_config.parallel_config
     model = vllm_config.model_config
     needs = {
@@ -115,6 +114,9 @@ def engine_delta_kwargs(vllm_config: Any, hidden_dim: int) -> dict[str, Any]:
         return {}
     return {
         "delta_row_bytes": cfg.max_row_bytes(hidden_dim),
+        "combine_row_bytes": (
+            combine.max_row_bytes(hidden_dim) if combine.enabled else 0
+        ),
         "settings": repr((cfg, combine)),
     }
 
@@ -525,26 +527,39 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
             partial = fused_expert_output.new_zeros((0, output.shape[-1]))
         partial = partial.contiguous()
         attn, ffn = self.delta.states()
-        # The peers' rows' partial sums into their states, on the stream the
-        # next layer's decode runs on.
+        # The peers' rows' partial sums (compressed with combine compression)
+        # into their states, on the stream the next layer's decode runs on.
         ffn.after_experts(slot, partial)
+        compressed, row_bytes = None, 0
+        if self.delta.combine.enabled:
+            row_bytes = ffn.combine_row_bytes(slot)
+            compressed = ffn.combine_bytes(slot, num_recv - r.own)
         dbo_yield_and_switch_from_compute_to_comm()
-        back = self.nixl.delta_combine_send(plan, partial, r.own)
+        back = self.nixl.delta_combine_send(plan, partial, r.own, compressed, row_bytes)
         dbo_switch_to_compute()
 
         def receiver() -> None:
             dbo_switch_to_comm()
-            self.nixl.delta_combine_accumulate(plan, back, output)
+            data = self.nixl.delta_combine_wait(plan)
             # Each peer's returned partial sums into its states; the own
             # block between them (rows to this rank) has none.
             num = plan.num_send - r.own
-            if r.start:
-                attn.after_combine(r.packed, r.start, back[: r.start])
-            if num > r.start:
-                rest = dataclasses.replace(r.packed, flat=r.packed.flat[r.start :])
-                attn.after_combine(
-                    rest, num - r.start, back[r.start + r.own : plan.num_send]
-                )
+            if data is not None:
+                # Compressed: rebuilt in fp32, into the states as they are and
+                # around the own block in the model dtype.
+                partials = attn.decode_combine(slot, data, num, r.packed.layer_pos)
+                attn.after_combine(r.packed, num, partials)
+                back[: r.start].copy_(partials[: r.start])
+                back[r.start + r.own : plan.num_send].copy_(partials[r.start :])
+            else:
+                if r.start:
+                    attn.after_combine(r.packed, r.start, back[: r.start])
+                if num > r.start:
+                    rest = dataclasses.replace(r.packed, flat=r.packed.flat[r.start :])
+                    attn.after_combine(
+                        rest, num - r.start, back[r.start + r.own : plan.num_send]
+                    )
+            self.nixl.delta_accumulate(plan, back, output)
             dbo_switch_to_compute_sync()
 
         return _noop_hook, receiver

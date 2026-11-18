@@ -72,7 +72,9 @@ rows for a peer back to back at their own sizes, WRITEs them to the start of
 its share and notifies ``d<seq>:<rows>:<bytes>``. The rows a rank sends
 itself never leave the GPU: the prepare/finalize puts them after the
 received rows, and their partial sums are copied into their dispatch place
-before the peers' ones are gathered around them.
+before the peers' ones are gathered around them. With combine compression
+(``combine_row_bytes`` > 0) the peers' partial sums travel as byte rows (a
+``cbytes`` region) that the prepare/finalize rebuilds.
 
 Same principle as afd-plugin's ``NixlRoutedAFDConnector`` (the AFD one-hop
 NIXL connector), written here because the EP all2all lives in vLLM and
@@ -146,6 +148,8 @@ class _PendingReceive:
     keys: list[tuple]
     recv_counts: list[int] | None = None
     plan: P2pAll2AllPlan | None = None
+    # [theseus p2p_delta] bytes of a compressed combine row (0: plain rows)
+    row_bytes: int = 0
 
 
 class P2pNixlAll2AllEngine(P2pAll2AllEngine):
@@ -163,6 +167,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         weights_dtype: torch.dtype = torch.float32,
         num_slots: int = 1,
         delta_row_bytes: int = 0,  # [theseus p2p_delta]
+        combine_row_bytes: int = 0,  # [theseus p2p_delta]
         settings: str = "",  # [theseus p2p_delta]
         **kwargs: Any,
     ) -> None:
@@ -204,8 +209,10 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         # order, unquantized); combine: the partial sums, hidden-sized.
         # [theseus p2p_delta] delta dispatch: byte rows of at most
         # delta_row_bytes and one int32 word per row instead of the hidden
-        # rows; settings: the delta settings every rank must share.
+        # rows; compressed combine rows of at most combine_row_bytes;
+        # settings: the delta settings every rank must share.
         self.delta_row_bytes = delta_row_bytes
+        self.combine_row_bytes = combine_row_bytes
         self.settings = settings
         hidden_keys = (
             [("dbytes", (delta_row_bytes,), torch.uint8), ("dwords", (1,), torch.int32)]
@@ -216,7 +223,10 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             ("recv1", (top_k,), ids_dtype),
             ("recv2", (top_k,), weights_dtype),
         ]
-        for key in (*hidden_keys, *routing_keys, ("back", (hidden_dim,), act_dtype)):
+        combine_keys = [("back", (hidden_dim,), act_dtype)]
+        if combine_row_bytes:
+            combine_keys.append(("cbytes", (combine_row_bytes,), torch.uint8))
+        for key in (*hidden_keys, *routing_keys, *combine_keys):
             self._alloc(key)
         # Delta dispatch keys in packing order: bytes, words, ids, weights.
         self._delta_keys = [*hidden_keys, *routing_keys] if delta_row_bytes else []
@@ -237,8 +247,9 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         self._regions[key] = region
         self._sends[key] = send
         self._gathers[key] = torch.empty((rows, *tail), dtype=dtype, device=self.device)
-        if kind != "back":
-            # combine_send copies the partial sums straight from the GPU.
+        if kind not in ("back", "cbytes"):
+            # combine_send copies the partial sums straight from the GPU
+            # ([theseus p2p_delta] compressed ones too).
             self._packs[key] = torch.empty(
                 (rows, *tail), dtype=dtype, device=self.device
             )
@@ -825,14 +836,21 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         return info
 
     def delta_combine_send(
-        self, plan: P2pAll2AllPlan, partial: torch.Tensor, own: int
+        self,
+        plan: P2pAll2AllPlan,
+        partial: torch.Tensor,
+        own: int,
+        compressed: torch.Tensor | None = None,
+        row_bytes: int = 0,
     ) -> torch.Tensor:
         """Return the partial sums of a delta dispatch: ``partial``
         (``[num_recv, ...]``) holds the peers' rows source-major, then this
-        rank's ``own`` rows. The peers' rows go back as WRITEs (``c<seq>``);
-        the own rows are copied on the GPU into their dispatch place of the
-        returned ``[num_send, ...]`` view, which ``delta_combine_accumulate``
-        completes."""
+        rank's ``own`` rows. The peers' rows go back as WRITEs (``c<seq>``),
+        as they are or ``compressed`` (uint8, flat: the same rows at
+        ``row_bytes`` each); the own rows are copied on the GPU into their
+        dispatch place of the returned ``[num_send, ...]`` view, which
+        ``delta_combine_wait`` completes (plain rows) or leaves to the
+        caller (compressed rows)."""
         if plan.num_recv is None or plan.recv_counts is None:
             raise RuntimeError("p2p_nixl: combine before delta_dispatch_wait")
         if partial.shape[0] != plan.num_recv:
@@ -847,35 +865,44 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         key = self._region("back", tuple(partial.shape[1:]), partial.dtype)
         rows = self._slot_rows(slot)
         num_in = plan.num_recv - own
-        staged = self._sends[key][rows][:num_in]
         # GPU -> pinned host, asynchronous; the WRITEs wait for the stream.
-        staged.copy_(partial[:num_in], non_blocking=True)
+        if compressed is None:
+            wire, size = key, partial.shape[1] * partial.element_size()
+            staged = self._sends[key][rows][:num_in]
+            staged.copy_(partial[:num_in], non_blocking=True)
+        else:
+            wire = self._region("cbytes", (self.combine_row_bytes,), torch.uint8)
+            size = row_bytes
+            staged = self._sends[wire][rows].view(-1)[: num_in * size]
+            staged.copy_(compressed[: num_in * size], non_blocking=True)
         back = self._gathers[key][rows][: plan.num_send]
         start = sum(plan.send_counts[: self.rank])
         back[start : start + own].copy_(partial[num_in:])
         notif = f"c{plan.seq}".encode()
         with _profile_range(f"p2p_nixl.combine_post[{slot}]"):
             self._wait_until(self._stream_done(), "packing")
-            row_bytes = staged.stride(0) * staged.element_size()
-            row = 0
+            base, row = staged.data_ptr(), 0
             for peer, count in enumerate(plan.recv_counts):
                 if peer == self.rank:
                     continue
                 if count:
-                    local = [(key, staged.data_ptr() + row * row_bytes, row_bytes)]
-                    self._write(slot, peer, local, count, notif)
+                    span = (wire, base + row * size, count * size)
+                    self._write_spans(slot, peer, [span], notif)
                 row += count
         self._pending[(slot, "c")] = _PendingReceive(
-            notif=notif, keys=[key], recv_counts=plan.send_counts
+            notif=notif,
+            keys=[wire],
+            recv_counts=plan.send_counts,
+            row_bytes=0 if compressed is None else size,
         )
         return back
 
-    def delta_combine_accumulate(
-        self, plan: P2pAll2AllPlan, back: torch.Tensor, out: torch.Tensor
-    ) -> torch.Tensor:
-        """Wait for the peers' partial sums of ``plan``'s delta combine,
-        gather them around this rank's own rows in ``back`` and sum them into
-        ``out`` as ``combine_accumulate`` does."""
+    def delta_combine_wait(self, plan: P2pAll2AllPlan) -> torch.Tensor | None:
+        """Wait for the peers' partial sums of ``plan``'s delta combine.
+        Plain rows go around this rank's own rows in the view
+        ``delta_combine_send`` returned (returns None); compressed rows are
+        gathered into one GPU byte buffer in dispatch order, the own block
+        left out, which is returned for the caller to rebuild."""
         slot = plan.slot
         with _profile_range(f"p2p_nixl.combine_wait[{slot}]"):
             pending = self._pending.pop((slot, "c"))
@@ -889,6 +916,17 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             rows = self._slot_rows(slot)
             region = self._regions[pending.keys[0]][rows]
             gather = self._gathers[pending.keys[0]][rows]
+            size = pending.row_bytes
+            if size:
+                flat, offset = gather.view(-1), 0
+                for p, count in enumerate(counts):
+                    if count and p != self.rank:
+                        share = region[p * R : (p + 1) * R].view(-1)[: count * size]
+                        flat[offset : offset + count * size].copy_(
+                            share, non_blocking=True
+                        )
+                        offset += count * size
+                return flat[:offset]
             row = 0
             for p, count in enumerate(counts):
                 if count and p != self.rank:
@@ -896,6 +934,13 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                         region[p * R : p * R + count], non_blocking=True
                     )
                 row += count
+        return None
+
+    def delta_accumulate(
+        self, plan: P2pAll2AllPlan, back: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """``combine_accumulate`` once ``delta_combine_wait`` has run (and
+        the caller has put the rebuilt compressed rows into ``back``)."""
         return super().combine_accumulate(plan, back, out)
 
 
