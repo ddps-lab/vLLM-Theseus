@@ -849,6 +849,20 @@ class MoERunner(MoERunnerInterface):
     # prepare_communication_buffer_for_model.
     # This is called after all weight loading and post-processing, so it
     # should be safe to swap out the quant_method.
+    def _bind_p2p_delta(self) -> None:
+        """[theseus p2p_delta] A delta dispatch prepare/finalize serves one
+        MoE layer: give it this layer's index and routed scale."""
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_delta import (
+            P2pDeltaPrepareAndFinalize,
+        )
+
+        kernel = getattr(self.routed_experts.quant_method, "moe_kernel", None)
+        prepare_finalize = getattr(
+            getattr(kernel, "impl", None), "prepare_finalize", None
+        )
+        if isinstance(prepare_finalize, P2pDeltaPrepareAndFinalize):
+            prepare_finalize.bind_layer(self)
+
     def maybe_init_modular_kernel(self) -> None:
         # NOTE(rob): WIP refactor. For quant methods that own the MK
         # we create the MK during process_weights_after_loading.
@@ -856,6 +870,8 @@ class MoERunner(MoERunnerInterface):
             self.routed_experts.quant_method.supports_internal_mk
             or self.routed_experts.quant_method.is_monolithic
         ):
+            # [theseus p2p_delta] the MK was built while loading the weights
+            self._bind_p2p_delta()
             return None
 
         self.routed_experts._ensure_moe_quant_config_init()
@@ -882,6 +898,7 @@ class MoERunner(MoERunnerInterface):
                     prepare_finalize,
                 )
             )
+            self._bind_p2p_delta()  # [theseus p2p_delta]
 
     #
     # Properties
