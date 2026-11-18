@@ -64,6 +64,16 @@ which has the same layout, one of those copies was seen never to return.
 
 The NIXL agent runs NIXL's progress thread (NIXL's default).
 
+[theseus p2p_delta] Delta dispatch (``delta_row_bytes`` > 0, driven by
+``prepare_finalize/p2p_delta.py``): the hidden region is replaced by a byte
+region of ``delta_row_bytes`` per row (the widest row format of
+``p2p_delta.py``) and a word region (one int32 per row). A rank packs its
+rows for a peer back to back at their own sizes, WRITEs them to the start of
+its share and notifies ``d<seq>:<rows>:<bytes>``. The rows a rank sends
+itself never leave the GPU: the prepare/finalize puts them after the
+received rows, and their partial sums are copied into their dispatch place
+before the peers' ones are gathered around them.
+
 Same principle as afd-plugin's ``NixlRoutedAFDConnector`` (the AFD one-hop
 NIXL connector), written here because the EP all2all lives in vLLM and
 cannot import the plugin. Limitation: unquantized rows only (no fp8 wire).
@@ -152,6 +162,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         ids_dtype: torch.dtype = torch.int32,
         weights_dtype: torch.dtype = torch.float32,
         num_slots: int = 1,
+        delta_row_bytes: int = 0,  # [theseus p2p_delta]
+        settings: str = "",  # [theseus p2p_delta]
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -190,13 +202,24 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         self._pending: dict[tuple[int, str], _PendingReceive] = {}
         # dispatch: hidden, ids, weights (the prepare sends them in this
         # order, unquantized); combine: the partial sums, hidden-sized.
-        for key in (
-            ("recv0", (hidden_dim,), act_dtype),
+        # [theseus p2p_delta] delta dispatch: byte rows of at most
+        # delta_row_bytes and one int32 word per row instead of the hidden
+        # rows; settings: the delta settings every rank must share.
+        self.delta_row_bytes = delta_row_bytes
+        self.settings = settings
+        hidden_keys = (
+            [("dbytes", (delta_row_bytes,), torch.uint8), ("dwords", (1,), torch.int32)]
+            if delta_row_bytes
+            else [("recv0", (hidden_dim,), act_dtype)]
+        )
+        routing_keys = [
             ("recv1", (top_k,), ids_dtype),
             ("recv2", (top_k,), weights_dtype),
-            ("back", (hidden_dim,), act_dtype),
-        ):
+        ]
+        for key in (*hidden_keys, *routing_keys, ("back", (hidden_dim,), act_dtype)):
             self._alloc(key)
+        # Delta dispatch keys in packing order: bytes, words, ids, weights.
+        self._delta_keys = [*hidden_keys, *routing_keys] if delta_row_bytes else []
         self._register_agents()
 
     # ---------------------------------------------------------------- setup
@@ -230,6 +253,7 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                 for key, region in self._regions.items()
             },
             self.num_slots,
+            self.settings,  # [theseus p2p_delta]
         )
         everyone: list[Any] = [None] * self.world_size
         dist.all_gather_object(everyone, mine, group=self.group)
@@ -238,9 +262,16 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
                 "p2p_nixl: every rank needs the same micro-batch count, got "
                 f"{[info[2] for info in everyone]}"
             )
+        # [theseus p2p_delta] the byte rows and words only line up when every
+        # rank runs the same delta dispatch settings.
+        if {info[3] for info in everyone} != {self.settings}:
+            raise RuntimeError(
+                "p2p_nixl: ranks differ in their delta dispatch settings: "
+                f"{[info[3] for info in everyone]}"
+            )
         for key in self._regions:
             self._peer_regions[key] = [info[1][key] for info in everyone]
-        for peer, (metadata, _, _) in enumerate(everyone):
+        for peer, (metadata, _, _, _) in enumerate(everyone):
             if peer == self.rank:
                 continue
             # add_remote_agent returns the name as bytes while notifications
@@ -592,6 +623,279 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
         ``out`` as the NCCL engine does."""
         with _profile_range(f"p2p_nixl.combine_wait[{plan.slot}]"):
             self._receive(plan.slot, "c")
+        return super().combine_accumulate(plan, back, out)
+
+    # ------------------------------------------- [theseus p2p_delta] delta
+    def wait_stream(self, what: str) -> None:
+        """Wait (servicing the WRITEs) until the current stream has run the
+        work queued so far, e.g. a copy into host memory about to be read."""
+        self._wait_until(self._stream_done(), what)
+
+    def delta_packs(self, slot: int) -> tuple[torch.Tensor, ...]:
+        """The GPU buffers a delta dispatch of ``slot`` is packed into, peer
+        major: bytes and words (flat), expert ids and weights (rows)."""
+        if not self.delta_row_bytes:
+            raise RuntimeError("p2p_nixl: delta dispatch is off")
+        rows = self._slot_rows(slot)
+        packs = [self._packs[key][rows] for key in self._delta_keys]
+        return packs[0].view(-1), packs[1].view(-1), packs[2], packs[3]
+
+    def _write_spans(
+        self,
+        slot: int,
+        peer: int,
+        spans: list[tuple[tuple, int, int]],
+        notif: bytes,
+    ) -> None:
+        """``_write`` for spans that are not whole rows: one WRITE of every
+        ``(key, address, bytes)`` of ``spans`` (this rank's registered send
+        memory) to the start of this rank's share of ``slot`` in ``peer``'s
+        region of ``key``, followed by ``notif``."""
+        R = self.max_tokens_per_rank
+        first_row = (slot * self.world_size + self.rank) * R
+        src: list[tuple[int, int, int]] = []
+        dst: list[tuple[int, int, int]] = []
+        for key, addr, size in spans:
+            peer_addr, peer_row_bytes = self._peer_regions[key][peer]
+            if size > R * peer_row_bytes:
+                raise RuntimeError(
+                    f"p2p_nixl: {size} bytes exceed the {key[0]} share of "
+                    f"{R * peer_row_bytes}"
+                )
+            src.append((addr, size, 0))
+            dst.append((peer_addr + first_row * peer_row_bytes, size, 0))
+        handle = self.agent.initialize_xfer(
+            "WRITE",
+            self.agent.get_xfer_descs(src, NIXL_MEM_TYPE),
+            self.agent.get_xfer_descs(dst, NIXL_MEM_TYPE),
+            self._peer_agents[peer],
+            notif,
+        )
+        state = self.agent.transfer(handle)
+        _mark(f"p2p_nixl.write_post[{slot}:{notif.decode()}:{peer}]")
+        if state == "ERR":
+            raise RuntimeError(f"p2p_nixl: WRITE to rank {peer} failed to post")
+        self._writes.setdefault(slot, []).append(handle)
+
+    def _wait_rows_bytes(
+        self, prefix: bytes, peers: list[int]
+    ) -> dict[int, tuple[int, int]]:
+        """``_wait_counts`` for the delta notifications
+        ``<prefix><rows>:<bytes>``: (rows, bytes) per peer."""
+        missing = {self._peer_agents[p]: p for p in peers}
+        got: dict[int, tuple[int, int]] = {}
+
+        def done() -> bool:
+            self._collect_notifs()
+            for name in list(missing):
+                notifs = self._notifs.get(name, [])
+                for notif in notifs:
+                    if notif.startswith(prefix):
+                        notifs.remove(notif)
+                        rows, _, size = notif[len(prefix) :].partition(b":")
+                        got[missing.pop(name)] = (int(rows), int(size))
+                        break
+            return not missing
+
+        self._wait_until(done, f"notification {prefix!r} from {sorted(missing)}")
+        return got
+
+    def dispatch_delta(
+        self,
+        plan: P2pAll2AllPlan,
+        counts: list[int],
+        nbytes: list[int],
+        min_rows: int = 0,
+    ) -> tuple[torch.Tensor, ...]:
+        """Send the rows packed in ``delta_packs(plan.slot)``: ``counts[p]``
+        rows of ``nbytes[p]`` bytes to every peer ``p``, in peer order (zero
+        for this rank, whose own rows stay on the GPU). Every peer gets one
+        WRITE and ``d<seq>:<rows>:<bytes>`` (a bare notification for no
+        rows). Returns the views ``delta_dispatch_wait`` fills: bytes and
+        words (flat), expert ids and weights (``min_rows`` rows, or the
+        slot's whole share)."""
+        slot = plan.slot
+        if not self.delta_row_bytes:
+            raise RuntimeError("p2p_nixl: delta dispatch is off")
+        if slot >= self.num_slots:
+            raise RuntimeError(
+                f"p2p_nixl: slot {slot} but the engine has {self.num_slots} "
+                "micro-batch slots"
+            )
+        if (slot, "d") in self._pending:
+            raise RuntimeError(
+                f"p2p_nixl: slot {slot} already has a dispatch in flight"
+            )
+        if counts[self.rank] or nbytes[self.rank]:
+            raise ValueError("p2p_nixl: a rank's own rows stay out of a delta dispatch")
+        keys = self._delta_keys
+        rows = self._slot_rows(slot)
+        packs = [self._packs[key][rows] for key in keys]
+        sends = [self._sends[key][rows] for key in keys]
+        num, total = sum(counts), sum(nbytes)
+        if num:
+            # GPU -> pinned host on the current stream; the WRITEs wait for it.
+            sends[0].view(-1)[:total].copy_(
+                packs[0].view(-1)[:total], non_blocking=True
+            )
+            for send, pack in zip(sends[1:], packs[1:]):
+                send[:num].copy_(pack[:num], non_blocking=True)
+        with _profile_range(f"p2p_nixl.dispatch_post[{slot}]"):
+            self._wait_until(self._stream_done(), "packing")
+            row = offset = 0
+            for peer, (count, size) in enumerate(zip(counts, nbytes)):
+                if peer == self.rank:
+                    continue
+                notif = f"d{plan.seq}:{count}:{size}".encode()
+                if count:
+                    spans = [(keys[0], sends[0].data_ptr() + offset, size)]
+                    for key, send in zip(keys[1:], sends[1:]):
+                        row_bytes = send.stride(0) * send.element_size()
+                        spans.append(
+                            (key, send.data_ptr() + row * row_bytes, count * row_bytes)
+                        )
+                    self._write_spans(slot, peer, spans, notif)
+                else:
+                    self.agent.send_notif(self._peer_agents[peer], notif)
+                    _mark(f"p2p_nixl.write_post[{slot}:{notif.decode()}:{peer}]")
+                row += count
+                offset += size
+        self._pending[(slot, "d")] = _PendingReceive(
+            notif=f"d{plan.seq}:".encode(), keys=list(keys), plan=plan
+        )
+        gathers = [self._gathers[key][rows] for key in keys]
+        out_rows = min_rows or self.world_size * self.max_tokens_per_rank
+        return (
+            gathers[0].view(-1),
+            gathers[1].view(-1),
+            gathers[2][:out_rows],
+            gathers[3][:out_rows],
+        )
+
+    def delta_dispatch_wait(
+        self, plan: P2pAll2AllPlan, own: int
+    ) -> list[tuple[int, int]]:
+        """Wait for the rows of ``plan``'s delta dispatch and gather the
+        peers' bytes, words, ids and weights source-major into the heads of
+        the views ``dispatch_delta`` returned (the caller puts this rank's
+        ``own`` rows after them). Fills in the plan's receive counts and
+        returns (rows, bytes) per rank, ``(own, 0)`` for this one."""
+        slot = plan.slot
+        with _profile_range(f"p2p_nixl.dispatch_wait[{slot}]"):
+            pending = self._pending.pop((slot, "d"))
+            self._finish_writes(slot)
+            got = self._wait_rows_bytes(
+                pending.notif, [p for p in range(self.world_size) if p != self.rank]
+            )
+            got[self.rank] = (own, 0)
+            info = [got[p] for p in range(self.world_size)]
+            self.set_recv_counts(plan, [count for count, _ in info])
+            assert plan.num_recv is not None
+            R = self.max_tokens_per_rank
+            rows = self._slot_rows(slot)
+            peers = [
+                (p, count, size)
+                for p, (count, size) in enumerate(info)
+                if p != self.rank and count
+            ]
+            # Bytes: each peer's rows at the head of its share, at their sizes.
+            region = self._regions[pending.keys[0]][rows]
+            gather = self._gathers[pending.keys[0]][rows].view(-1)
+            offset = 0
+            for p, _, size in peers:
+                share = region[p * R : (p + 1) * R].view(-1)[:size]
+                gather[offset : offset + size].copy_(share, non_blocking=True)
+                offset += size
+            for key in pending.keys[1:]:
+                region = self._regions[key][rows]
+                gather = self._gathers[key][rows]
+                # The rows past num_recv may still hold ids of an earlier
+                # dispatch (see mask_rows_past).
+                dirty = (slot, gather.data_ptr())
+                if dirty in self._dirty_rows:
+                    self._dirty_rows[dirty] = max(
+                        self._dirty_rows[dirty], plan.num_recv
+                    )
+                row = 0
+                for p, count, _ in peers:
+                    gather[row : row + count].copy_(
+                        region[p * R : p * R + count], non_blocking=True
+                    )
+                    row += count
+        return info
+
+    def delta_combine_send(
+        self, plan: P2pAll2AllPlan, partial: torch.Tensor, own: int
+    ) -> torch.Tensor:
+        """Return the partial sums of a delta dispatch: ``partial``
+        (``[num_recv, ...]``) holds the peers' rows source-major, then this
+        rank's ``own`` rows. The peers' rows go back as WRITEs (``c<seq>``);
+        the own rows are copied on the GPU into their dispatch place of the
+        returned ``[num_send, ...]`` view, which ``delta_combine_accumulate``
+        completes."""
+        if plan.num_recv is None or plan.recv_counts is None:
+            raise RuntimeError("p2p_nixl: combine before delta_dispatch_wait")
+        if partial.shape[0] != plan.num_recv:
+            raise ValueError(
+                f"partial has {partial.shape[0]} rows, plan expects {plan.num_recv}"
+            )
+        if own != plan.send_counts[self.rank] or own != plan.recv_counts[self.rank]:
+            raise ValueError(f"p2p_nixl: {own} own rows do not match the plan")
+        slot = plan.slot
+        if (slot, "c") in self._pending:
+            raise RuntimeError(f"p2p_nixl: slot {slot} already has a combine in flight")
+        key = self._region("back", tuple(partial.shape[1:]), partial.dtype)
+        rows = self._slot_rows(slot)
+        num_in = plan.num_recv - own
+        staged = self._sends[key][rows][:num_in]
+        # GPU -> pinned host, asynchronous; the WRITEs wait for the stream.
+        staged.copy_(partial[:num_in], non_blocking=True)
+        back = self._gathers[key][rows][: plan.num_send]
+        start = sum(plan.send_counts[: self.rank])
+        back[start : start + own].copy_(partial[num_in:])
+        notif = f"c{plan.seq}".encode()
+        with _profile_range(f"p2p_nixl.combine_post[{slot}]"):
+            self._wait_until(self._stream_done(), "packing")
+            row_bytes = staged.stride(0) * staged.element_size()
+            row = 0
+            for peer, count in enumerate(plan.recv_counts):
+                if peer == self.rank:
+                    continue
+                if count:
+                    local = [(key, staged.data_ptr() + row * row_bytes, row_bytes)]
+                    self._write(slot, peer, local, count, notif)
+                row += count
+        self._pending[(slot, "c")] = _PendingReceive(
+            notif=notif, keys=[key], recv_counts=plan.send_counts
+        )
+        return back
+
+    def delta_combine_accumulate(
+        self, plan: P2pAll2AllPlan, back: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Wait for the peers' partial sums of ``plan``'s delta combine,
+        gather them around this rank's own rows in ``back`` and sum them into
+        ``out`` as ``combine_accumulate`` does."""
+        slot = plan.slot
+        with _profile_range(f"p2p_nixl.combine_wait[{slot}]"):
+            pending = self._pending.pop((slot, "c"))
+            self._finish_writes(slot)
+            counts = pending.recv_counts
+            assert counts is not None
+            self._wait_notifs(
+                {p: pending.notif for p, c in enumerate(counts) if c and p != self.rank}
+            )
+            R = self.max_tokens_per_rank
+            rows = self._slot_rows(slot)
+            region = self._regions[pending.keys[0]][rows]
+            gather = self._gathers[pending.keys[0]][rows]
+            row = 0
+            for p, count in enumerate(counts):
+                if count and p != self.rank:
+                    gather[row : row + count].copy_(
+                        region[p * R : p * R + count], non_blocking=True
+                    )
+                row += count
         return super().combine_accumulate(plan, back, out)
 
 
