@@ -234,27 +234,32 @@ class Stub:
         self.routed_output_transform = None
 
 
-def run(monkeypatch, world, ubatches, fixed, forwards, coef, mode, scale, norm):
+def run(
+    monkeypatch, world, ubatches, fixed, forwards, coef, mode, scale, norm, combine=None
+):
     """Run every forward through one world (``mode`` "off", a delta mode or a
-    ``delta_dispatch`` mapping). Returns per (forward, layer, rank,
-    micro-batch) the output, the expert input rows (x, ids, weights; the
-    first num_recv) and the receive counts, and for stateful modes both
-    sides' states after every layer."""
+    ``delta_dispatch`` mapping; ``combine`` the combine settings). Returns
+    per (forward, layer, rank, micro-batch) the output, the expert input rows
+    (x, ids, weights; the first num_recv) and the receive counts, and for
+    stateful modes both sides' states after every layer."""
     if mode == "off":
         engines = make_engines(monkeypatch, world, ubatches)
     else:
         raw = {"mode": mode} if isinstance(mode, str) else dict(mode)
         cfg = DeltaDispatchConfig.from_mapping(raw)
-        settings = {"delta_row_bytes": cfg.max_row_bytes(HIDDEN), "settings": repr(raw)}
+        ccfg = CombineConfig.from_mapping(combine)
+        settings = {
+            "delta_row_bytes": cfg.max_row_bytes(HIDDEN),
+            "combine_row_bytes": ccfg.max_row_bytes(HIDDEN) if ccfg.enabled else 0,
+            "settings": repr((raw, combine)),
+        }
         engines = make_engines(monkeypatch, world, ubatches, lambda rank: settings)
         ranks = []
         for r in range(world):
             layers = P2pDeltaLayers()
             for layer in MOE_LAYERS:
                 layers.register(layer, norm)
-            ranks.append(
-                P2pDeltaRank(cfg, CombineConfig(), layers, HIDDEN, MAX_TOKENS, world, r)
-            )
+            ranks.append(P2pDeltaRank(cfg, ccfg, layers, HIDDEN, MAX_TOKENS, world, r))
     pfs = []
     for r, engine in enumerate(engines):
         per_layer = {}
@@ -573,17 +578,82 @@ def test_configs_refuse_unsupported_setups(change, need):
         p2p_delta_configs(vllm_config(**change))
 
 
-def test_combine_compression_is_refused_for_now():
+def test_combine_compression_sizes_the_engine():
     config = vllm_config(
         additional_config={
             "p2p_delta": {
-                "delta_dispatch": {"mode": "delta_fp32"},
-                "combine": {"mode": "int8"},
+                "delta_dispatch": {"mode": "delta_nvfp4", "first": "nvfp4"},
+                "combine": {"mode": "nvfp4", "int8_layers": [0]},
             }
         }
     )
-    with pytest.raises(NotImplementedError, match="combine"):
-        p2p_delta_configs(config)
+    kwargs = engine_delta_kwargs(config, HIDDEN)
+    # The widest combine row: int8 on the listed layer.
+    assert kwargs["combine_row_bytes"] == HIDDEN + HIDDEN // 128 * 4
+    alone = vllm_config(additional_config={"p2p_delta": {"combine": {"mode": "int8"}}})
+    with pytest.raises(ValueError, match="needs delta dispatch"):
+        p2p_delta_configs(alone)
+
+
+COMBINED = [
+    ({"mode": "x_int8"}, {"mode": "int8", "ef": False}),
+    ({"mode": "x_nvfp4"}, {"mode": "nvfp4", "ef": False}),
+    ({"mode": "delta_int8", "first": "int8"}, {"mode": "int8", "ef": True}),
+    ({"mode": "delta_nvfp4", "first": "nvfp4"}, {"mode": "nvfp4", "ef": True}),
+    (
+        {"mode": "delta_nvfp4", "first": "nvfp4", "int8_layers": [1, 3]},
+        {"mode": "nvfp4", "ef": True, "int8_layers": [1, 3]},
+    ),
+]
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize(
+    "dispatch, combine",
+    COMBINED,
+    ids=lambda s: "-".join(str(v) for v in s.values()),
+)
+@pytest.mark.parametrize("world", [2, 4])
+def test_combine_compression_keeps_own_rows_exact(
+    monkeypatch, world, dispatch, combine, fixed
+):
+    """With compressed partial sums a token served by its own rank only gets
+    the plain path's output exactly, the others come close, and both sides'
+    states (built from what was sent and what was rebuilt) stay equal."""
+    ubatches = 2
+    gen = torch.Generator().manual_seed(91 + world + fixed)
+    norm = FusedAddNorm(
+        (1 + 0.1 * torch.randn(HIDDEN, generator=gen)).to(torch.bfloat16)
+    )
+    coef = 0.2 * torch.randn(NUM_EXPERTS, generator=gen)
+    forwards = make_forwards(world, ubatches, norm, gen)
+    args = (monkeypatch, world, ubatches, fixed, forwards, coef)
+    off, _ = run(*args, "off", 1.0, norm)
+    delta, states = run(*args, dispatch, 1.0, norm, combine)
+    alone, errors = 0, []
+    for (f, layer, r, u), plain in off.items():
+        got = delta[f, layer, r, u]["out"]
+        ids = forwards[f][layer][r, u][2].long()
+        only_own = (ids // (NUM_EXPERTS // world) == r).all(-1)
+        assert torch.equal(got[only_own], plain["out"][only_own])
+        alone += int(only_own.sum())
+        if (~only_own).any():
+            p, g = plain["out"][~only_own].float(), got[~only_own].float()
+            errors.append((g - p).norm(dim=-1) / p.norm(dim=-1).clamp_min(1e-6))
+    # Relative errors, per token: the largest ones come from partial sums that
+    # nearly cancel, so the median is checked.
+    errors = torch.cat(errors)
+    assert (errors > 0).any() and float(errors.median()) < 0.2
+    # With two experts a rank (4 ranks) no token keeps all its top-3 home.
+    assert alone or world == 4
+    if not DeltaDispatchConfig.from_mapping(dispatch).stateful:
+        return
+    for (f, layer), rows in visited_rows(world, forwards).items():
+        per_rank = states[f, layer]
+        tokens = {key: v[1].shape[0] for key, v in forwards[f][layer].items()}
+        for r, u, dest, t in rows:
+            attn = per_rank[r][0][u][dest * tokens[r, u] + t]
+            assert torch.equal(attn, per_rank[dest][1][u][r * MAX_TOKENS + t])
 
 
 def encode_decode(module, mode, first, seed):
