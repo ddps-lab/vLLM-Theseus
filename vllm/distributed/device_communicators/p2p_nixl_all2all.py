@@ -230,6 +230,8 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             self._alloc(key)
         # Delta dispatch keys in packing order: bytes, words, ids, weights.
         self._delta_keys = [*hidden_keys, *routing_keys] if delta_row_bytes else []
+        # slot -> its views of the delta pack buffers (delta_packs).
+        self._delta_pack_views: dict[int, tuple[torch.Tensor, ...]] = {}
         self._register_agents()
 
     # ---------------------------------------------------------------- setup
@@ -645,11 +647,15 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
     def delta_packs(self, slot: int) -> tuple[torch.Tensor, ...]:
         """The GPU buffers a delta dispatch of ``slot`` is packed into, peer
         major: bytes and words (flat), expert ids and weights (rows)."""
-        if not self.delta_row_bytes:
-            raise RuntimeError("p2p_nixl: delta dispatch is off")
-        rows = self._slot_rows(slot)
-        packs = [self._packs[key][rows] for key in self._delta_keys]
-        return packs[0].view(-1), packs[1].view(-1), packs[2], packs[3]
+        packs = self._delta_pack_views.get(slot)
+        if packs is None:
+            if not self.delta_row_bytes:
+                raise RuntimeError("p2p_nixl: delta dispatch is off")
+            rows = self._slot_rows(slot)
+            by_key = [self._packs[key][rows] for key in self._delta_keys]
+            packs = (by_key[0].view(-1), by_key[1].view(-1), by_key[2], by_key[3])
+            self._delta_pack_views[slot] = packs
+        return packs
 
     def _write_spans(
         self,
@@ -741,15 +747,14 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             raise ValueError("p2p_nixl: a rank's own rows stay out of a delta dispatch")
         keys = self._delta_keys
         rows = self._slot_rows(slot)
-        packs = [self._packs[key][rows] for key in keys]
+        packs = self.delta_packs(slot)
         sends = [self._sends[key][rows] for key in keys]
         num, total = sum(counts), sum(nbytes)
         if num:
             # GPU -> pinned host on the current stream; the WRITEs wait for it.
-            sends[0].view(-1)[:total].copy_(
-                packs[0].view(-1)[:total], non_blocking=True
-            )
-            for send, pack in zip(sends[1:], packs[1:]):
+            sends[0].view(-1)[:total].copy_(packs[0][:total], non_blocking=True)
+            sends[1].view(-1)[:num].copy_(packs[1][:num], non_blocking=True)
+            for send, pack in zip(sends[2:], packs[2:]):
                 send[:num].copy_(pack[:num], non_blocking=True)
         with _profile_range(f"p2p_nixl.dispatch_post[{slot}]"):
             self._wait_until(self._stream_done(), "packing")
@@ -876,8 +881,9 @@ class P2pNixlAll2AllEngine(P2pAll2AllEngine):
             staged = self._sends[wire][rows].view(-1)[: num_in * size]
             staged.copy_(compressed[: num_in * size], non_blocking=True)
         back = self._gathers[key][rows][: plan.num_send]
-        start = sum(plan.send_counts[: self.rank])
-        back[start : start + own].copy_(partial[num_in:])
+        if own:
+            start = sum(plan.send_counts[: self.rank])
+            back[start : start + own].copy_(partial[num_in:])
         notif = f"c{plan.seq}".encode()
         with _profile_range(f"p2p_nixl.combine_post[{slot}]"):
             self._wait_until(self._stream_done(), "packing")

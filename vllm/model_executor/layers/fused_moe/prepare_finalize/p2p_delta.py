@@ -245,6 +245,8 @@ class P2pDeltaRank:
         self.cfg, self.combine, self.layers = cfg, combine, layers
         self.hidden, self.max_tokens = hidden, max_tokens
         self.world_size, self.rank = world_size, rank
+        # The smallest and largest row of the mode, in bytes.
+        self.row_bytes = (cfg.min_row_bytes(hidden), cfg.max_row_bytes(hidden))
         self.routed_scale: float | None = None
         self._bound: set[int] = set()
         self._attn: AttentionDeltaState | None = None
@@ -375,8 +377,7 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
 
     def _check_sizes(self, info: list[tuple[int, int]]) -> None:
         """Each peer's bytes fit its rows' formats (a host check)."""
-        low = self.delta.cfg.min_row_bytes(self.delta.hidden)
-        high = self.delta.cfg.max_row_bytes(self.delta.hidden)
+        low, high = self.delta.row_bytes
         for peer, (count, size) in enumerate(info):
             if peer != self.rank and not count * low <= size <= count * high:
                 raise RuntimeError(
@@ -422,7 +423,7 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
                 f"p2p_delta: h' {tuple(src.shape)} {src.dtype} does not match "
                 f"the MoE input {tuple(a1.shape)} {a1.dtype}"
             )
-        pending = engine.begin_plan(topk_ids, slot, expert_owner=self.expert_owner)
+        pending = self._begin_plan(topk_ids, slot)
         # As for the plain path's deferred-receive engines: no yield before
         # the plan wait, the receiver waits after the modular kernel's yield.
         dbo_switch_to_comm_sync()
@@ -431,16 +432,20 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
         counts = list(plan.send_counts)
         own = counts[self.rank]
         start = sum(counts[: self.rank])
+        end = start + own
         counts[self.rank] = 0
         num = plan.num_send - own
-        order = pending.order
-        # The peers' entries of the destination-major order: this rank's own
-        # block cut out.
-        remote = (
-            torch.cat((order[:start], order[start + own : plan.num_send]))
-            if own
-            else order[:num]
-        )
+        order, perm = pending.order, plan.perm
+        # The peers' entries of the destination-major order and their tokens
+        # (perm = order % num_tokens), this rank's own block cut out: views
+        # unless the block lies between other ranks' blocks.
+        if not own or end == plan.num_send:
+            remote, tokens = order[:num], perm[:num]
+        elif start == 0:
+            remote, tokens = order[own : plan.num_send], perm[own:]
+        else:
+            remote = torch.cat((order[:start], order[end : plan.num_send]))
+            tokens = torch.cat((perm[:start], perm[end:]))
         fixed = self._fixed_launch_ok()
         with _profile_range(f"p2p_delta.encode[{slot}]"):
             packed = attn.prepare(layer, slot, remote, num_tokens)
@@ -452,7 +457,6 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
             out_bytes, out_words, out_ids, out_weights = engine.delta_packs(slot)
             if num:
                 attn.encode(packed, src, num, out_bytes, out_words, self.rank)
-                tokens = remote % num_tokens
                 torch.index_select(topk_ids, 0, tokens, out=out_ids[:num])
                 torch.index_select(topk_weights, 0, tokens, out=out_weights[:num])
         recv_bytes, recv_words, recv_ids, recv_weights = engine.dispatch_delta(
@@ -472,7 +476,7 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
                 ids, weights = recv_ids, recv_weights
             else:
                 ids, weights = recv_ids[:num_recv], recv_weights[:num_recv]
-            own_tokens = order[start : start + own] % max(num_tokens, 1)
+            own_tokens = perm[start:end]
             if own:
                 torch.index_select(topk_ids, 0, own_tokens, out=ids[num_in:num_recv])
                 torch.index_select(
@@ -561,8 +565,10 @@ class P2pDeltaPrepareAndFinalize(P2pNcclPrepareAndFinalize):
                 # around the own block in the model dtype.
                 partials = attn.decode_combine(slot, data, num, r.packed.layer_pos)
                 attn.after_combine(r.packed, num, partials)
-                back[: r.start].copy_(partials[: r.start])
-                back[r.start + r.own : plan.num_send].copy_(partials[r.start :])
+                if r.start:
+                    back[: r.start].copy_(partials[: r.start])
+                if num > r.start:
+                    back[r.start + r.own : plan.num_send].copy_(partials[r.start :])
             else:
                 if r.start:
                     attn.after_combine(r.packed, r.start, back[: r.start])
