@@ -867,7 +867,7 @@ class MoERunner(MoERunnerInterface):
             return
         owner = getattr(self, "p2p_expert_owner", None)
         if owner is not None:
-            prepare_finalize.expert_owner = owner.to(prepare_finalize.engine.device)
+            prepare_finalize.bind_expert_owner(owner.to(prepare_finalize.engine.device))
         if isinstance(prepare_finalize, P2pDeltaPrepareAndFinalize):
             prepare_finalize.bind_layer(self)
 

@@ -293,7 +293,7 @@ def run(
             if fixed:
                 pf._fixed_experts = types.SimpleNamespace()
             if tables is not None:
-                pf.expert_owner = tables[layer]
+                pf.bind_expert_owner(tables[layer])
             per_layer[layer] = pf
         pfs.append(per_layer)
     current = {"u": 0}
