@@ -28,6 +28,10 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_one
 from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_two_sided import (  # noqa: E501
     FlashInferNVLinkTwoSidedPrepareAndFinalize,
 )
+from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_delta import (
+    P2pDeltaPrepareAndFinalize,
+    p2p_delta_rank,
+)
 from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_nccl import (
     P2pNcclPrepareAndFinalize,
 )
@@ -351,13 +355,29 @@ def maybe_make_prepare_finalize(
                 act_dtype=moe.in_dtype,
             )
         )
-        prepare_finalize = P2pNcclPrepareAndFinalize(
-            handle,
-            num_dispatchers=all2all_manager.world_size,
-            num_experts=moe.num_experts,
-            num_local_experts=moe.num_local_experts,
-            rank=all2all_manager.rank,
-        )
+        # [theseus p2p_delta] delta dispatch when the engine carries byte rows
+        delta = p2p_delta_rank(handle, get_current_vllm_config(), moe.hidden_dim)
+        if delta is not None:
+            if quant_config is not None and quant_config.quant_dtype is not None:
+                raise NotImplementedError(
+                    "p2p_delta sends unquantized rows; the experts are quantized"
+                )
+            prepare_finalize = P2pDeltaPrepareAndFinalize(
+                handle,
+                num_dispatchers=all2all_manager.world_size,
+                num_experts=moe.num_experts,
+                num_local_experts=moe.num_local_experts,
+                rank=all2all_manager.rank,
+                delta=delta,
+            )
+        else:
+            prepare_finalize = P2pNcclPrepareAndFinalize(
+                handle,
+                num_dispatchers=all2all_manager.world_size,
+                num_experts=moe.num_experts,
+                num_local_experts=moe.num_local_experts,
+                rank=all2all_manager.rank,
+            )
 
     # [theseus prerouted] tokens were delivered by an external transport
     elif moe.use_prerouted_kernels:
@@ -370,8 +390,11 @@ def maybe_make_prepare_finalize(
         placement_counts = (
             get_current_vllm_config().parallel_config.expert_placement_counts
         )
+        # [theseus expert placement] so are the lists of a placement file.
+        placement_file = get_current_vllm_config().parallel_config.expert_placement_file
         if (
             placement_counts is None
+            and placement_file is None
             and moe.num_experts % moe.moe_parallel_config.ep_size != 0
         ):
             raise NotImplementedError(
@@ -379,7 +402,7 @@ def maybe_make_prepare_finalize(
                 "id // num_local_experts, which needs num_experts "
                 f"({moe.num_experts}) divisible by ep_size "
                 f"({moe.moe_parallel_config.ep_size}) unless "
-                "expert_placement_counts is set."
+                "expert_placement_counts or expert_placement_file is set."
             )
         if moe.moe_parallel_config.is_sequence_parallel:
             raise NotImplementedError(

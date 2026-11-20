@@ -53,6 +53,10 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_delta import (
+    p2p_delta_configs,
+    p2p_delta_layers,
+)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -1268,6 +1272,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        # [theseus p2p_delta] delta dispatch of the aggregated p2p_nixl path:
+        # the receiving ranks normalize h' with this layer's norm.
+        self.p2p_delta = is_moe_layer and p2p_delta_configs(vllm_config)[0].enabled
+        if self.p2p_delta:
+            p2p_delta_layers().register(layer_idx, self.post_attention_layernorm)
 
     def forward(
         self,
@@ -1324,6 +1333,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.p2p_delta:
+            # [theseus p2p_delta] h' for this layer's dispatch
+            p2p_delta_layers().record(self.layer_idx, residual)
         if self.use_sequence_parallel_moe:
             hidden_states = self.mlp(
                 hidden_states,
