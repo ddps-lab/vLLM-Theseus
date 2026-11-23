@@ -847,6 +847,30 @@ class MoERunner(MoERunnerInterface):
 
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
+    def _bind_p2p(self) -> None:
+        """[theseus p2p_delta] [theseus expert placement] A p2p
+        prepare/finalize serves one MoE layer: give it this layer's expert ->
+        rank table (placement file) and, for delta dispatch, the layer's
+        index and routed scale."""
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_delta import (
+            P2pDeltaPrepareAndFinalize,
+        )
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_nccl import (
+            P2pNcclPrepareAndFinalize,
+        )
+
+        kernel = getattr(self.routed_experts.quant_method, "moe_kernel", None)
+        prepare_finalize = getattr(
+            getattr(kernel, "impl", None), "prepare_finalize", None
+        )
+        if not isinstance(prepare_finalize, P2pNcclPrepareAndFinalize):
+            return
+        owner = getattr(self, "p2p_expert_owner", None)
+        if owner is not None:
+            prepare_finalize.bind_expert_owner(owner.to(prepare_finalize.engine.device))
+        if isinstance(prepare_finalize, P2pDeltaPrepareAndFinalize):
+            prepare_finalize.bind_layer(self)
+
     # This is called after all weight loading and post-processing, so it
     # should be safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
@@ -856,6 +880,8 @@ class MoERunner(MoERunnerInterface):
             self.routed_experts.quant_method.supports_internal_mk
             or self.routed_experts.quant_method.is_monolithic
         ):
+            # [theseus p2p_delta] the MK was built while loading the weights
+            self._bind_p2p()
             return None
 
         self.routed_experts._ensure_moe_quant_config_init()
@@ -882,6 +908,7 @@ class MoERunner(MoERunnerInterface):
                     prepare_finalize,
                 )
             )
+            self._bind_p2p()  # [theseus p2p_delta]
 
     #
     # Properties

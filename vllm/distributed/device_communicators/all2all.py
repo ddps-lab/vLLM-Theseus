@@ -1106,6 +1106,11 @@ class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
         if self._engine is None:
             from vllm.config import get_current_vllm_config
 
+            # [theseus p2p_delta]
+            from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_delta import (  # noqa: E501
+                engine_delta_kwargs,
+            )
+
             cfg = get_current_vllm_config()
             num_slots = max(1, cfg.parallel_config.num_ubatches)
             num_local_experts = kwargs["num_local_experts"]
@@ -1124,6 +1129,8 @@ class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
                 top_k=kwargs["top_k"],
                 act_dtype=kwargs["act_dtype"],
                 num_slots=num_slots,
+                # [theseus p2p_delta] byte rows instead of hidden rows when on
+                **engine_delta_kwargs(cfg, kwargs["hidden_dim"]),
             )
             logger.info_once(
                 "p2p_nixl all2all: world_size=%d, %d local experts, "

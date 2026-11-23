@@ -51,6 +51,7 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllEngine,
+    P2pAll2AllPendingPlan,
     P2pAll2AllPlan,
 )
 from vllm.logger import init_logger
@@ -196,6 +197,11 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.rank_expert_offset = rank * num_local_experts
         # One in-flight plan per micro-batch slot.
         self._plans: dict[int, P2pAll2AllPlan] = {}
+        # [theseus expert placement] this layer's expert -> rank table (int64,
+        # on the engine device) from a placement file, set by the MoE runner
+        # (bind_expert_owner); None: id // num_local_experts.
+        self.expert_owner: torch.Tensor | None = None
+        self._owner_padded: torch.Tensor | None = None
         self._num_prepares = 0  # DEBUG(p2p_nccl)
         # Fixed-size launch (see the module docstring): rows handed to the
         # experts kernel.
@@ -217,6 +223,22 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             and fused_experts.quant_config.quant_dtype is None
         ):
             self._fixed_experts = fused_experts
+
+    def bind_expert_owner(self, owner: torch.Tensor) -> None:
+        """[theseus expert placement] Route by this layer's expert -> rank
+        table (int64, on the engine device)."""
+        self.expert_owner = owner
+        # One more entry, -1 (no rank), at the end: padding ids (< 0) clamp
+        # to -1 and read it, so the rank of every pair is one gather (the
+        # engine's expert_owner path spends five small kernels on the
+        # padding). Same plan as expert_owner=owner.
+        self._owner_padded = torch.cat([owner, owner.new_full((1,), -1)])
+
+    def _begin_plan(self, topk_ids: torch.Tensor, slot: int) -> P2pAll2AllPendingPlan:
+        if self._owner_padded is None:
+            return self.engine.begin_plan(topk_ids, slot)
+        rank_of = self._owner_padded[topk_ids.clamp(min=-1)]
+        return self.engine.begin_plan(topk_ids, slot, rank_of=rank_of)
 
     def _fixed_launch_ok(self) -> bool:
         experts = self._fixed_experts
@@ -291,7 +313,7 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quantize_on_receive,
             )
         self._num_prepares += 1
-        pending = self.engine.begin_plan(topk_ids, slot)
+        pending = self._begin_plan(topk_ids, slot)
         # Under DBO: hand the CPU to the other micro-batch first, then move
         # to the communication stream and post the count exchange, whose host
         # copy blocks the CPU. Yielding first queues the other micro-batch's
@@ -368,14 +390,17 @@ class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 assert lo >= 0 and hi < self.num_experts, (
                     f"p2p_nccl: received expert ids out of range [{lo}, {hi}]"
                 )
-                is_local = (
-                    torch.div(
-                        real_ids.to(torch.int64),
-                        self.num_local_experts,
-                        rounding_mode="floor",
+                if self.expert_owner is not None:  # [theseus expert placement]
+                    is_local = self.expert_owner[real_ids.long()] == self.rank
+                else:
+                    is_local = (
+                        torch.div(
+                            real_ids.to(torch.int64),
+                            self.num_local_experts,
+                            rounding_mode="floor",
+                        )
+                        == self.rank
                     )
-                    == self.rank
-                )
                 assert bool(is_local.any(dim=1).all()), (
                     "p2p_nccl: received a token that selects none of this "
                     "rank's experts"
