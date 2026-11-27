@@ -5,6 +5,7 @@ import importlib
 import inspect
 import json
 import os
+import gc
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
@@ -438,6 +439,13 @@ class TorchProfilerWrapper(WorkerProfiler):
             # only print profiler results on rank 0
             if rank == 0:
                 print(table)
+
+        # exp3_parallelism: free the finished profiler now, while no profiler
+        # session is active. Left to the cyclic garbage collector it is freed at an
+        # arbitrary later step, which crashed in libkineto once the next session
+        # had been started.
+        self.profiler = None  # type: ignore[assignment]
+        gc.collect()
 
     @override
     def _profiler_step(self) -> bool:
