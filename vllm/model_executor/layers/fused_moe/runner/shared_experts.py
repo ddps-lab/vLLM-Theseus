@@ -54,8 +54,6 @@ class SharedExperts(torch.nn.Module):
         self.enable_dbo = enable_dbo
         # [theseus ubatch] one output slot per micro-batch (--enable-dbo: 2,
         # --ubatch-size N: N).
-        from vllm.config import get_current_vllm_config_or_none
-
         vllm_config = get_current_vllm_config_or_none()
         num_slots = 1
         if vllm_config is not None and vllm_config.parallel_config.use_ubatching:
