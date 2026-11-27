@@ -1579,6 +1579,12 @@ class Worker(WorkerBase):
         )
 
     def execute_dummy_batch(self) -> None:
+        # A DP rank without requests runs dummy batches in step with the ranks
+        # that have them (its experts still serve their tokens). Count these
+        # steps so a scheduled profiler window opens on this rank as well;
+        # annotate_profile() only counts steps that carry scheduler output.
+        if self.profiler:
+            self.profiler.step()
         self.model_runner._dummy_run(
             self.model_runner.decode_query_len,
             uniform_decode=True,
