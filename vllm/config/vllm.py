@@ -1591,7 +1591,7 @@ class VllmConfig:
         executor_supports_async_sched = executor_class.supports_async_scheduling()
         uses_rocm_deepep_ht_dbo = (
             current_platform.is_rocm()
-            and self.parallel_config.enable_dbo
+            and self.parallel_config.use_ubatching  # [theseus ubatch] was enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 
@@ -2087,6 +2087,21 @@ class VllmConfig:
                 f"cudagraph_mode={self.compilation_config.cudagraph_mode}"
             )
 
+        # [theseus p2p_nccl] the per-layer count exchange is a host sync
+        # ([theseus p2p_nixl] same count exchange)
+        if (
+            self.parallel_config.all2all_backend in ("p2p_nccl", "p2p_nixl")
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            logger.warning(
+                "all2all_backend=%s exchanges per-destination token counts "
+                "with the host in every MoE layer, which cannot be captured in a "
+                "CUDA graph. Disabling CUDA graphs (equivalent to "
+                "-cc.cudagraph_mode=none).",
+                self.parallel_config.all2all_backend,
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
             if current_platform.is_rocm():
@@ -2094,6 +2109,8 @@ class VllmConfig:
                     "deepep_low_latency",
                     "deepep_high_throughput",
                     "nixl_ep",
+                    "p2p_nccl",  # [theseus p2p_nccl]
+                    "p2p_nixl",  # [theseus p2p_nixl]
                     # The naive DP/EP prepare/finalize runs its all-gather /
                     # reduce-scatter on the comm stream under DBO.
                     "allgather_reducescatter",
@@ -2104,6 +2121,8 @@ class VllmConfig:
                     "deepep_low_latency",
                     "deepep_high_throughput",
                     "nixl_ep",
+                    "p2p_nccl",  # [theseus p2p_nccl]
+                    "p2p_nixl",  # [theseus p2p_nixl]
                 ]
             assert a2a_backend in supported_backends, (
                 "Microbatching currently only supports the "

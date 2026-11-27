@@ -1104,6 +1104,19 @@ class FusedMoEParallelConfig:
             and self.all2all_backend == "allgather_reducescatter"
         )
 
+    # [theseus p2p_nccl]
+    @property
+    def use_p2p_nccl_kernels(self):
+        return self.use_all2all_kernels and self.all2all_backend in (
+            "p2p_nccl",
+            "p2p_nixl",  # [theseus p2p_nixl] same prepare/finalize
+        )
+
+    # [theseus prerouted]
+    @property
+    def use_prerouted_kernels(self):
+        return self.use_all2all_kernels and self.all2all_backend == "prerouted"
+
     @property
     def use_passthrough_all2all(self):
         # Not gated on use_all2all_kernels: the experts dispatch and combine
@@ -1640,6 +1653,16 @@ class FusedMoEConfig:
     @property
     def use_ag_rs_all2all_kernels(self):
         return self.moe_parallel_config.use_ag_rs_all2all_kernels
+
+    # [theseus p2p_nccl]
+    @property
+    def use_p2p_nccl_kernels(self):
+        return self.moe_parallel_config.use_p2p_nccl_kernels
+
+    # [theseus prerouted]
+    @property
+    def use_prerouted_kernels(self):
+        return self.moe_parallel_config.use_prerouted_kernels
 
     @property
     def use_nixl_ep_kernels(self):

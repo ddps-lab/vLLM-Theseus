@@ -1,0 +1,498 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Prepare/Finalize for the ``p2p_nccl`` all2all backend.
+
+Tokens are sent only to the expert-parallel ranks that own at least one of
+their selected experts (see ``P2pAll2AllEngine``). After the dispatch the
+local experts kernel runs unchanged: expert ids that do not belong to this
+rank are rewritten to an id the ``expert_map`` maps to ``-1`` (the same trick
+the DeepEP high-throughput path uses) and their routing weights are zeroed.
+The combine returns the weighted partial sums to the owner rank, so the
+finalize output is already reduced across the EP group.
+
+When the experts kernel wants quantized inputs, activations are quantized
+before the dispatch and the quantized values travel on the wire (8-bit
+tensors are sent as uint8 views). Per-token or per-group scales are sent
+along as an extra tensor; static scales are replicated on every rank and are
+not sent. The one exception is a dynamic per-tensor scale (fp8/int8 without
+static input scale, block shape or per-token quantization): it depends on
+the sender's batch, so those activations travel unquantized and are
+quantized after the dispatch, as the DeepEP backend does.
+
+Fixed-size launch: the number of received rows differs per rank and per
+layer, and the Triton experts kernel is compiled again for every new shape
+it meets, so each rank would stop at a different time to compile while the
+others wait in the combine. The experts kernel therefore always gets the
+whole receive buffer (the most rows this rank can receive in one step:
+world size x max tokens per rank). Rows past the received ones get expert
+id -1, which the align step drops, and the experts kernel is told how many
+rows are real (``fixed_launch.py``) so that its non-JIT steps (activation,
+sum over top-k) stop there; the finalize returns only the real rows. The
+Triton kernels then see one shape and are compiled once, at start-up.
+Quantized activations, and a step that receives more rows than the fixed
+size, are launched at the received size as before.
+
+Dual batch overlap: ``prepare_async``/``finalize_async`` follow the DeepEP
+normal-mode pattern. The thread yields to the other micro-batch *before*
+posting the count exchange and blocking on the host copy of the counts, so
+the other micro-batch's compute is already queued while this thread waits,
+and each micro-batch's dispatch directly follows its own count exchange on
+the communicator. Each micro-batch uses its own engine slot (buffers and
+counts).
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable
+
+import torch
+
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed.device_communicators.p2p_nccl_all2all import (
+    P2pAll2AllEngine,
+    P2pAll2AllPlan,
+)
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import fixed_launch
+from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceContiguous,
+    TopKWeightAndReduceDelegate,
+)
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+from vllm.v1.worker.ubatching import (
+    dbo_current_ubatch_id,
+    dbo_enabled,
+    dbo_switch_to_comm,
+    dbo_switch_to_comm_sync,
+    dbo_switch_to_compute,
+    dbo_switch_to_compute_sync,
+    dbo_yield_and_switch_from_comm_to_compute,
+    dbo_yield_and_switch_from_compute_to_comm,
+)
+
+logger = init_logger(__name__)
+
+# DEBUG(p2p_nccl): off by default (see p2p_nccl_all2all.py).
+_DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
+
+
+def quantize_before_dispatch(quant_config: FusedMoEQuantConfig) -> bool:
+    """Whether the activations can be quantized on the sending rank.
+
+    Scales that are static (replicated on every rank) or that have one row
+    per token (per-token, per-block, nvfp4/mxfp4 groups) survive the
+    dispatch. A dynamic per-tensor scale (fp8/int8 without a static input
+    scale, block shape or per-token quantization) depends on the sender's
+    whole batch and is not sent, so those activations travel unquantized and
+    are quantized on the receiving rank, as the DeepEP backend does.
+    """
+    quant_dtype = quant_config.quant_dtype
+    if quant_dtype is None:
+        return False
+    if isinstance(quant_dtype, str):
+        # nvfp4 / mxfp4: per-group scales with a static global scale.
+        return True
+    if quant_config.per_act_token_quant or quant_config.block_shape is not None:
+        return True
+    return quant_config.a1_scale is not None
+
+
+def _quantize_for_dispatch(
+    a1: torch.Tensor,
+    quant_config: FusedMoEQuantConfig,
+    defer_input_quant: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Quantize ``a1`` before the dispatch.
+
+    Returns ``(a1q, scale_to_send, scale)``. ``scale_to_send`` is the scale
+    tensor when it has one row per token (it travels with the tokens),
+    otherwise ``None`` (static scale, replicated on every rank). When the
+    quantization cannot happen on the sender (see
+    ``quantize_before_dispatch``) ``a1`` is returned unchanged.
+    """
+    if defer_input_quant or not quantize_before_dispatch(quant_config):
+        return a1, None, None
+    input_sf = (
+        quant_config.a1_gscale if quant_config.use_nvfp4_w4a4 else quant_config.a1_scale
+    )
+    # Scale swizzling pads to multiples of 128 rows, which would break the
+    # per-token split; swizzle after the dispatch instead.
+    a1q, a1q_scale = moe_kernel_quantize_input(
+        a1,
+        input_sf,
+        quant_dtype=quant_config.quant_dtype,
+        per_act_token_quant=quant_config.per_act_token_quant,
+        block_shape=quant_config.block_shape,
+        is_scale_swizzled=False,
+        mx_alignment=getattr(quant_config, "mx_alignment", 0),
+    )
+    per_row = (
+        a1q_scale is not None
+        and a1q_scale.ndim > 0
+        and a1q_scale.shape[0] == a1.shape[0]
+    )
+    return a1q, (a1q_scale if per_row else None), a1q_scale
+
+
+def _quantize_after_dispatch(
+    recv_a1: torch.Tensor,
+    quant_config: FusedMoEQuantConfig,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Quantize received rows whose scale could not travel (see above)."""
+    if recv_a1.numel() == 0:
+        return recv_a1, None
+    return moe_kernel_quantize_input(
+        recv_a1,
+        quant_config.a1_scale,
+        quant_dtype=quant_config.quant_dtype,
+        per_act_token_quant=quant_config.per_act_token_quant,
+        block_shape=quant_config.block_shape,
+        is_scale_swizzled=quant_config.is_scale_swizzled,
+        mx_alignment=getattr(quant_config, "mx_alignment", 0),
+    )
+
+
+def _scale_after_dispatch(
+    recv_scale: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    quant_config: FusedMoEQuantConfig,
+) -> torch.Tensor | None:
+    if recv_scale is None:
+        return scale
+    if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
+        if recv_scale.element_size() == 1:
+            recv_scale = recv_scale.view(torch.uint8)
+        recv_scale = nvfp4_block_scale_interleave(recv_scale)
+    return recv_scale
+
+
+def _noop_hook() -> None:
+    # NCCL transfers need no explicit completion call. Returning a hook
+    # still makes the modular kernel yield once more under DBO, which lets
+    # the other micro-batch compute while our transfer is in flight.
+    return None
+
+
+class P2pNcclPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+    """Selective point-to-point dispatch/combine over NCCL send/recv."""
+
+    def __init__(
+        self,
+        engine: P2pAll2AllEngine,
+        num_dispatchers: int,
+        num_experts: int,
+        num_local_experts: int,
+        rank: int,
+    ) -> None:
+        super().__init__()
+        self.engine = engine
+        self._num_dispatchers = num_dispatchers
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.rank = rank
+        self.rank_expert_offset = rank * num_local_experts
+        # One in-flight plan per micro-batch slot.
+        self._plans: dict[int, P2pAll2AllPlan] = {}
+        self._num_prepares = 0  # DEBUG(p2p_nccl)
+        # Fixed-size launch (see the module docstring): rows handed to the
+        # experts kernel.
+        self._fixed_rows = engine.world_size * engine.max_tokens_per_rank
+        # Set by post_init_setup: only the unquantized Triton experts kernel
+        # reads the real-row count (other kernels would compute the padding,
+        # and a dynamic activation scale would cover it).
+        self._fixed_experts: mk.FusedMoEExperts | None = None
+        self._fixed_overflow_logged = False
+        # One prepare/finalize per MoE layer: log once per process.
+        logger.info_once(
+            "p2p_nccl P/F rank=%d: fixed-size experts launch, %d rows",
+            rank, self._fixed_rows,
+        )
+
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
+        if (
+            type(fused_experts).__name__ == "TritonExperts"
+            and fused_experts.quant_config.quant_dtype is None
+        ):
+            self._fixed_experts = fused_experts
+
+    def _fixed_launch_ok(self) -> bool:
+        experts = self._fixed_experts
+        return (
+            experts is not None and getattr(experts, "_lora_context", None) is None
+        )
+
+    @property
+    def activation_format(self) -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
+
+    def max_num_tokens_per_rank(self) -> int | None:
+        return None
+
+    def topk_indices_dtype(self) -> torch.dtype | None:
+        return None
+
+    def num_dispatchers(self) -> int:
+        return self._num_dispatchers
+
+    def output_is_reduced(self) -> bool:
+        return True
+
+    def supports_async(self) -> bool:
+        return True
+
+    # --------------------------------------------------------------- prepare
+    def prepare_async(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
+    ) -> tuple[Callable, mk.ReceiverType]:
+        if num_experts != self.num_experts:
+            raise ValueError(
+                f"layer has {num_experts} experts, backend was built for "
+                f"{self.num_experts}"
+            )
+        if apply_router_weight_on_input:
+            assert topk_ids.size(1) == 1, (
+                "apply_router_weight_on_input is only implemented for topk=1"
+            )
+            a1 = a1 * topk_weights.to(a1.dtype)
+
+        a1q, scale_to_send, a1q_scale = _quantize_for_dispatch(
+            a1, quant_config, defer_input_quant
+        )
+        quantize_on_receive = (
+            a1q is a1
+            and not defer_input_quant
+            and quant_config.quant_dtype is not None
+        )
+        tensors: list[torch.Tensor] = [a1q, topk_ids, topk_weights]
+        if scale_to_send is not None:
+            tensors.append(scale_to_send)
+
+        slot = dbo_current_ubatch_id()
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
+        if _DEBUG and self._num_prepares < 8:
+            logger.info(
+                "p2p_nccl P/F rank=%d prepare#%d dbo=%s slot=%d T=%d topk=%d "
+                "ids_dtype=%s quant_dtype=%s defer_input_quant=%s wire_dtype=%s "
+                "quantize_on_receive=%s",
+                self.rank, self._num_prepares, dbo_enabled(), slot,
+                a1.shape[0], topk_ids.shape[1], topk_ids.dtype,
+                quant_config.quant_dtype, defer_input_quant, a1q.dtype,
+                quantize_on_receive,
+            )
+        self._num_prepares += 1
+        pending = self.engine.begin_plan(topk_ids, slot)
+        # Under DBO: hand the CPU to the other micro-batch first, then move
+        # to the communication stream and post the count exchange, whose host
+        # copy blocks the CPU. Yielding first queues the other micro-batch's
+        # compute before this thread blocks, and keeps the communicator order
+        # "exchange(i), dispatch(i)" so the dispatch of this micro-batch is
+        # not queued behind the other's count exchange -- the same order as
+        # vLLM's DeepEP normal path. Without DBO these calls are no-ops.
+        # An engine that waits for its rows on the host (deferred_receive)
+        # does not yield here: the other micro-batch would then be polling
+        # for its own rows when it gets the CPU, and this dispatch would
+        # wait for them too. Its wait happens in the receiver, after the
+        # modular kernel's yield.
+        if self.engine.deferred_receive:
+            dbo_switch_to_comm_sync()
+        else:
+            dbo_yield_and_switch_from_compute_to_comm()
+        self.engine.exchange_counts(pending)
+        plan = self.engine.finish_plan(pending)
+        # An engine whose rows carry their counts (NIXL) knows num_recv only
+        # after dispatch_wait; _fixed_rows covers every rank's full share, so
+        # the fixed-size launch always fits then.
+        counts_known = plan.num_recv is not None
+        fixed = (
+            self._fixed_launch_ok()
+            and quant_config.quant_dtype is None
+            and (not counts_known or plan.num_recv <= self._fixed_rows)
+        )
+        if counts_known and plan.num_recv > self._fixed_rows:
+            if not self._fixed_overflow_logged:
+                logger.warning(
+                    "p2p_nccl P/F rank=%d: received %d rows > fixed launch size "
+                    "%d; launching at the received size",
+                    self.rank, plan.num_recv, self._fixed_rows,
+                )
+                self._fixed_overflow_logged = True
+        received = self.engine.dispatch(
+            plan, tuple(tensors), min_rows=self._fixed_rows if fixed else 0
+        )
+        if not fixed and counts_known:
+            received = [r[: plan.num_recv] for r in received]
+        recv_a1, recv_ids, recv_weights = received[0], received[1], received[2]
+        recv_scale = received[3] if scale_to_send is not None else None
+        self._plans[slot] = plan
+        dbo_switch_to_compute_sync()
+
+        def receiver() -> mk.PrepareResultType:
+            nonlocal recv_a1, recv_ids, recv_weights, recv_scale
+            if self.engine.deferred_receive:
+                self.engine.dispatch_wait(plan)
+            if not fixed and not counts_known:
+                # The counts arrived with the rows: trim the views now.
+                recv_a1 = recv_a1[: plan.num_recv]
+                recv_ids = recv_ids[: plan.num_recv]
+                recv_weights = recv_weights[: plan.num_recv]
+                if recv_scale is not None:
+                    recv_scale = recv_scale[: plan.num_recv]
+            # The ids are global and the experts kernel skips the slots whose
+            # expert_map entry is -1 (align/sum kernels and the Triton kernel
+            # all do), so the received ids and weights pass through as they
+            # are, as in the allgather/reduce-scatter path.
+            num_recv = plan.num_recv
+            if fixed:
+                # Fixed-size launch: the rows past num_recv get expert id -1
+                # and the experts kernel learns how many rows are real.
+                self.engine.mask_rows_past(plan.slot, recv_ids, num_recv)
+                fixed_launch.set_valid_rows(num_recv, recv_ids.shape[0])
+            else:
+                fixed_launch.clear_valid_rows()
+            # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG=2; these checks
+            # synchronize with the device.
+            if _DEBUG >= 2 and num_recv > 0:
+                real_ids = recv_ids[:num_recv]
+                lo, hi = int(real_ids.min()), int(real_ids.max())
+                assert lo >= 0 and hi < self.num_experts, (
+                    f"p2p_nccl: received expert ids out of range [{lo}, {hi}]"
+                )
+                is_local = (
+                    torch.div(
+                        real_ids.to(torch.int64),
+                        self.num_local_experts,
+                        rounding_mode="floor",
+                    )
+                    == self.rank
+                )
+                assert bool(is_local.any(dim=1).all()), (
+                    "p2p_nccl: received a token that selects none of this "
+                    "rank's experts"
+                )
+
+            if quantize_on_receive:
+                # Dynamic per-tensor scale: quantize the received rows here.
+                recv_a1q, recv_a1q_scale = _quantize_after_dispatch(
+                    recv_a1, quant_config
+                )
+                return recv_a1q, recv_a1q_scale, None, recv_ids, recv_weights
+            recv_a1q_scale = _scale_after_dispatch(recv_scale, a1q_scale, quant_config)
+            return recv_a1, recv_a1q_scale, None, recv_ids, recv_weights
+
+        return _noop_hook, receiver
+
+    def prepare(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
+    ) -> mk.PrepareResultType:
+        hook, receiver = self.prepare_async(
+            a1,
+            topk_weights,
+            topk_ids,
+            num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            quant_config,
+            defer_input_quant,
+        )
+        hook()
+        return receiver()
+
+    # -------------------------------------------------------------- finalize
+    def finalize_async(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> tuple[Callable, Callable]:
+        slot = dbo_current_ubatch_id()
+        plan = self._plans.pop(slot, None)
+        assert plan is not None, "finalize called without a matching prepare"
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
+        if _DEBUG and plan.seq < 8:
+            logger.info(
+                "p2p_nccl P/F rank=%d finalize plan#%d slot=%d expert_out=%s "
+                "output=%s",
+                self.rank, plan.seq, slot, tuple(fused_expert_output.shape),
+                tuple(output.shape),
+            )
+
+        if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
+            weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+
+        # The real-row count was for this layer's experts call only.
+        fixed_launch.clear_valid_rows()
+        if fused_expert_output.shape[0] > plan.num_recv:
+            # Fixed-size launch: only the first num_recv rows are real.
+            fused_expert_output = fused_expert_output[: plan.num_recv]
+            topk_weights = topk_weights[: plan.num_recv]
+            topk_ids = topk_ids[: plan.num_recv]
+        if fused_expert_output.numel() != 0:
+            partial = weight_and_reduce_impl.apply(
+                output=None,
+                fused_expert_output=fused_expert_output,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        else:
+            partial = fused_expert_output.new_zeros((0, output.shape[-1]))
+        partial = partial.contiguous()
+
+        dbo_yield_and_switch_from_compute_to_comm()
+        back = self.engine.combine_send(plan, partial)
+        dbo_switch_to_compute()
+
+        def receiver() -> None:
+            dbo_switch_to_comm()
+            # A deferred_receive engine polls for the partial sums here; it
+            # must not yield afterwards, or the other micro-batch's attention
+            # of the next layer would wait for this one's poll.
+            self.engine.combine_accumulate(plan, back, output)
+            if self.engine.deferred_receive:
+                dbo_switch_to_compute_sync()
+            else:
+                dbo_yield_and_switch_from_comm_to_compute()
+
+        return _noop_hook, receiver
+
+    def finalize(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> None:
+        hook, receiver = self.finalize_async(
+            output,
+            fused_expert_output,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            weight_and_reduce_impl,
+        )
+        hook()
+        receiver()

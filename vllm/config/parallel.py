@@ -54,6 +54,9 @@ All2AllBackend = Literal[
     "mori",
     "nixl_ep",
     "allgather_reducescatter",
+    "p2p_nccl",  # [theseus p2p_nccl]
+    "p2p_nixl",  # [theseus p2p_nixl]
+    "prerouted",  # [theseus prerouted]
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
     "flashinfer_nvlink_two_sided",
     "flashinfer_nvlink_one_sided",
@@ -226,10 +229,22 @@ class ParallelConfig:
       with 4 experts and 2 ranks, rank 0 will have experts [0, 2] and rank 1
       will have experts [1, 3]. This strategy can help improve load balancing
       for grouped expert models with no redundant experts."""
+    expert_placement_counts: list[int] | None = None  # [theseus expert counts]
+    """Number of routed experts on each EP rank, in rank order, for the
+    "linear" strategy. For example, `48 16` places experts [0, 48) on rank 0
+    and [48, 64) on rank 1. Unset distributes them evenly. Uneven counts need a
+    MoE kernel that follows `expert_map` (`--moe-backend triton`)."""
     all2all_backend: All2AllBackend = "allgather_reducescatter"
     """All2All backend for MoE expert parallel communication. Available options:
 
     - "allgather_reducescatter": All2all based on allgather and reducescatter
+    - "p2p_nccl": Point-to-point NCCL send/recv to the ranks that own the
+      selected experts only (works over TCP, eager mode only)
+    - "p2p_nixl": Same as p2p_nccl but the rows travel as one-sided NIXL
+      WRITEs (UCX; works over TCP); the count exchange stays NCCL. Eager
+      mode, one micro-batch, unquantized rows only
+    - "prerouted": No all2all. The tokens were already delivered to the rank
+      that owns their experts by an external transport (AFD FFN role)
     - "deepep_high_throughput": Use deepep high-throughput kernels
     - "deepep_low_latency": Use deepep low-latency kernels
     - "mori_high_throughput": MoRI EP with InterNodeV1 for multi-node
@@ -631,6 +646,36 @@ class ParallelConfig:
                 )
             # Only EPLB needs the model's expert count to pick a default.
             self.eplb_config.num_redundant_experts = 0
+
+        # [theseus expert counts] The EP size and expert count are checked per
+        # MoE layer (determine_expert_map), where both are known.
+        counts = self.expert_placement_counts
+        if counts is not None:
+            if not counts or min(counts) < 1:
+                raise ValueError(
+                    f"expert_placement_counts must be positive, got {counts}."
+                )
+            if self.expert_placement_strategy != "linear":
+                raise ValueError(
+                    "expert_placement_counts requires the linear placement strategy."
+                )
+            # These assume the even split (the weight filter computes its own).
+            if (
+                self.enable_eplb
+                or self.enable_elastic_ep
+                or self.enable_ep_weight_filter
+            ):
+                raise ValueError(
+                    "expert_placement_counts does not support EPLB, elastic EP or "
+                    "enable_ep_weight_filter."
+                )
+            # Backends that route by the expert map rather than by
+            # id // num_local_experts.
+            if self.all2all_backend not in ("allgather_reducescatter", "prerouted"):
+                raise ValueError(
+                    "expert_placement_counts supports the allgather_reducescatter "
+                    f"and prerouted all2all backends, got {self.all2all_backend!r}."
+                )
 
         tp = self.tensor_parallel_size
         pcp = self.prefill_context_parallel_size

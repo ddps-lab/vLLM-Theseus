@@ -31,8 +31,14 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_one
 from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_two_sided import (  # noqa: E501
     FlashInferNVLinkTwoSidedPrepareAndFinalize,
 )
+from vllm.model_executor.layers.fused_moe.prepare_finalize.p2p_nccl import (
+    P2pNcclPrepareAndFinalize,
+)
 from vllm.model_executor.layers.fused_moe.prepare_finalize.passthrough import (
     PassThroughPrepareAndFinalize,
+)
+from vllm.model_executor.layers.fused_moe.prepare_finalize.prerouted import (
+    PreroutedPrepareAndFinalize,
 )
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import (
@@ -446,6 +452,77 @@ def maybe_make_prepare_finalize(
             num_dispatchers=all2all_manager.world_size,
             dispatch_format=dispatch_layout.dispatch_format,
             extra_payload_bytes_per_token=dispatch_layout.extra_payload_bytes_per_token,
+        )
+
+    # [theseus p2p_nccl] build the point-to-point prepare/finalize
+    # ([theseus p2p_nixl] shares it; only the engine differs)
+    elif moe.use_p2p_nccl_kernels:
+        backend = moe.moe_parallel_config.all2all_backend
+        if moe.moe_parallel_config.enable_eplb:
+            raise NotImplementedError(
+                f"all2all_backend={backend} assumes a contiguous expert "
+                "placement and does not support EPLB yet."
+            )
+        if moe.num_experts % moe.moe_parallel_config.ep_size != 0:
+            raise NotImplementedError(
+                f"all2all_backend={backend} maps expert ids to ranks as "
+                "id // num_local_experts, which needs num_experts "
+                f"({moe.num_experts}) divisible by ep_size "
+                f"({moe.moe_parallel_config.ep_size})."
+            )
+        if moe.moe_parallel_config.is_sequence_parallel:
+            raise NotImplementedError(
+                f"all2all_backend={backend} does not support sequence-parallel MoE."
+            )
+        handle = all2all_manager.get_handle(
+            dict(
+                num_local_experts=moe.num_local_experts,
+                max_tokens_per_rank=moe.max_num_tokens,
+                # [theseus p2p_nixl] region shapes (ignored by p2p_nccl)
+                hidden_dim=moe.hidden_dim,
+                top_k=moe.experts_per_token,
+                act_dtype=moe.in_dtype,
+            )
+        )
+        prepare_finalize = P2pNcclPrepareAndFinalize(
+            handle,
+            num_dispatchers=all2all_manager.world_size,
+            num_experts=moe.num_experts,
+            num_local_experts=moe.num_local_experts,
+            rank=all2all_manager.rank,
+        )
+
+    # [theseus prerouted] tokens were delivered by an external transport
+    elif moe.use_prerouted_kernels:
+        if moe.moe_parallel_config.enable_eplb:
+            raise NotImplementedError(
+                "all2all_backend=prerouted assumes a contiguous expert "
+                "placement and does not support EPLB."
+            )
+        # Explicit placement counts are followed through expert_map.
+        placement_counts = (
+            get_current_vllm_config().parallel_config.expert_placement_counts
+        )
+        if (
+            placement_counts is None
+            and moe.num_experts % moe.moe_parallel_config.ep_size != 0
+        ):
+            raise NotImplementedError(
+                "all2all_backend=prerouted maps expert ids to ranks as "
+                "id // num_local_experts, which needs num_experts "
+                f"({moe.num_experts}) divisible by ep_size "
+                f"({moe.moe_parallel_config.ep_size}) unless "
+                "expert_placement_counts is set."
+            )
+        if moe.moe_parallel_config.is_sequence_parallel:
+            raise NotImplementedError(
+                "all2all_backend=prerouted does not support sequence-parallel MoE."
+            )
+        prepare_finalize = PreroutedPrepareAndFinalize(
+            num_experts=moe.num_experts,
+            num_local_experts=moe.num_local_experts,
+            rank=all2all_manager.rank,
+            num_dispatchers=all2all_manager.world_size,
         )
 
     elif moe.use_ag_rs_all2all_kernels and allow_new_interface:

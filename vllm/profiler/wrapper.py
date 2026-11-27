@@ -302,6 +302,11 @@ class TorchProfilerWrapper(WorkerProfiler):
             with_stack=profiler_config.torch_profiler_with_stack,
             with_flops=profiler_config.torch_profiler_with_flops,
             on_trace_ready=trace_handler,
+            experimental_config=(
+                torch.profiler._ExperimentalConfig(profile_all_threads=True)
+                if profiler_config.torch_profiler_all_threads
+                else None
+            ),
         )
         self._profiler_kwargs = dict(self._base_profiler_kwargs)
         if profiler_kwargs:

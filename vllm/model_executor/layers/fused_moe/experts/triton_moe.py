@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe import fixed_launch
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation_supported,
@@ -353,6 +354,15 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
+        # Rows past valid_rows are padding of a fixed-size launch (see
+        # fixed_launch.py; their expert ids are -1, so the align step drops
+        # them and the GEMMs never touch them). The GEMMs still get the full
+        # shape so that their compile key stays the same; the activation and
+        # the top-k sum stop at valid_rows.
+        valid_rows = fixed_launch.valid_rows(num_tokens)
+        if valid_rows is not None and self._lora_context is not None:
+            valid_rows = None
+        act_rows = num_tokens if valid_rows is None else valid_rows
 
         if global_num_experts == -1:
             global_num_experts = E
@@ -646,9 +656,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quant_dtype=current_platform.fp8_dtype(),
             )
         else:
-            self.activation(
-                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
+            if act_rows > 0:
+                self.activation(
+                    activation,
+                    intermediate_cache2[: act_rows * top_k_num],
+                    intermediate_cache1[:act_rows].view(-1, N),
+                )
 
             # Row-local schemes quantize per row, but a per-tensor dynamic
             # scale spans the whole activation. Restrict it to routed rows so
@@ -763,9 +776,14 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 output,
             )
         else:
-            self._finalize_expert_output(
-                intermediate_cache3, output, topk_ids, expert_map
-            )
+            # [theseus fixed launch] the sum over top-k stops at the real rows
+            if act_rows > 0:
+                self._finalize_expert_output(
+                    intermediate_cache3[:act_rows],
+                    output[:act_rows],
+                    topk_ids[:act_rows] if topk_ids is not None else None,
+                    expert_map,
+                )
 
     def moe_sum(
         self,

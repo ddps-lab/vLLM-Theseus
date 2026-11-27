@@ -31,6 +31,8 @@ from vllm.utils.import_utils import (
 from vllm.utils.math_utils import round_up
 
 from .base_device_communicator import All2AllManagerBase, Cache
+from .p2p_nccl_all2all import P2pAll2AllEngine
+from .p2p_nixl_all2all import P2pNixlAll2AllEngine  # [theseus p2p_nixl]
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe import QuantFormat
@@ -1344,3 +1346,140 @@ class MoonEPAll2AllManager(All2AllManagerBase):
             for _, handle in self.handle_cache._cache.items():
                 handle.destroy()
             self.handle_cache._cache.clear()
+
+
+# [theseus p2p_nccl] manager for the point-to-point backend
+class P2pNcclAll2AllManager(All2AllManagerBase):
+    """
+    Selective point-to-point all2all over NCCL send/recv (torch.distributed
+    all_to_all_single with variable splits). Tokens are only sent to the EP
+    ranks that own one of their selected experts. Dispatch/combine are driven
+    by P2pNcclPrepareAndFinalize through the engine handle; the generic
+    dispatch()/combine() entry points are intentionally unsupported.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        super().__init__(cpu_group, tcp_store_group)
+        self._engine: P2pAll2AllEngine | None = None
+
+    def get_handle(self, kwargs):
+        num_local_experts = kwargs["num_local_experts"]
+        max_tokens_per_rank = kwargs["max_tokens_per_rank"]
+        if self._engine is None:
+            # The EP group is only fully constructed after this manager is
+            # created, so resolve its NCCL process group lazily.
+            ep_group = get_ep_group()
+            self._engine = P2pAll2AllEngine(
+                group=ep_group.device_group,
+                rank=self.rank,
+                world_size=self.world_size,
+                num_local_experts=num_local_experts,
+                max_tokens_per_rank=max_tokens_per_rank,
+                device=ep_group.device,
+            )
+            logger.info_once(
+                "p2p_nccl all2all: world_size=%d, %d local experts, "
+                "buffer capacity %d rows per tensor.",
+                self.world_size,
+                num_local_experts,
+                self._engine.capacity,
+            )
+        else:
+            assert self._engine.num_local_experts == num_local_experts, (
+                "p2p_nccl all2all: layers with different local expert counts "
+                "are not supported"
+            )
+            if max_tokens_per_rank > self._engine.max_tokens_per_rank:
+                self._engine.max_tokens_per_rank = max_tokens_per_rank
+                self._engine.capacity = max_tokens_per_rank
+        return self._engine
+
+    def dispatch_router_logits(self, *args, **kwargs):
+        raise NotImplementedError(
+            "p2p_nccl all2all is used through P2pNcclPrepareAndFinalize"
+        )
+
+    def dispatch(self, *args, **kwargs):
+        raise NotImplementedError(
+            "p2p_nccl all2all is used through P2pNcclPrepareAndFinalize"
+        )
+
+    def combine(self, *args, **kwargs):
+        raise NotImplementedError(
+            "p2p_nccl all2all is used through P2pNcclPrepareAndFinalize"
+        )
+
+    def destroy(self):
+        self._engine = None
+
+
+# [theseus prerouted] placeholder manager for externally routed EP ranks
+
+
+# [theseus p2p_nixl] same backend with the rows carried by NIXL WRITEs
+class P2pNixlAll2AllManager(P2pNcclAll2AllManager):
+    """``P2pNcclAll2AllManager`` whose engine moves the rows with one-sided
+    NIXL WRITEs (``p2p_nixl_all2all.py``); the count exchange stays NCCL.
+    Unquantized rows only; one set of regions per micro-batch."""
+
+    def get_handle(self, kwargs):
+        if self._engine is None:
+            from vllm.config import get_current_vllm_config
+
+            cfg = get_current_vllm_config()
+            num_slots = max(1, cfg.parallel_config.num_ubatches)
+            num_local_experts = kwargs["num_local_experts"]
+            max_tokens_per_rank = kwargs["max_tokens_per_rank"]
+            ep_group = get_ep_group()
+            self._engine = P2pNixlAll2AllEngine(
+                group=ep_group.device_group,
+                rank=self.rank,
+                world_size=self.world_size,
+                num_local_experts=num_local_experts,
+                max_tokens_per_rank=max_tokens_per_rank,
+                device=ep_group.device,
+                # The regions are registered before the metadata exchange,
+                # so the shapes are needed now (see p2p_nixl_all2all.py).
+                hidden_dim=kwargs["hidden_dim"],
+                top_k=kwargs["top_k"],
+                act_dtype=kwargs["act_dtype"],
+                num_slots=num_slots,
+            )
+            logger.info_once(
+                "p2p_nixl all2all: world_size=%d, %d local experts, "
+                "buffer capacity %d rows per tensor, regions %d rows x %d "
+                "micro-batch slots, backend UCX.",
+                self.world_size,
+                num_local_experts,
+                self._engine.capacity,
+                self.world_size * max_tokens_per_rank,
+                num_slots,
+            )
+            return self._engine
+        return super().get_handle(kwargs)
+
+
+class PreroutedAll2AllManager(All2AllManagerBase):
+    """
+    Placeholder manager for the "prerouted" backend: the tokens of this EP
+    rank were already delivered by an external transport (e.g. the AFD
+    one-hop connector), so no all2all communication is performed here.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None):
+        super().__init__(cpu_group, tcp_store_group)
+
+    def get_handle(self, kwargs):
+        return None
+
+    def dispatch_router_logits(self, *args, **kwargs):
+        raise NotImplementedError("prerouted all2all performs no communication")
+
+    def dispatch(self, *args, **kwargs):
+        raise NotImplementedError("prerouted all2all performs no communication")
+
+    def combine(self, *args, **kwargs):
+        raise NotImplementedError("prerouted all2all performs no communication")
+
+    def destroy(self):
+        pass
